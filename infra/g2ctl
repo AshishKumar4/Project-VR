@@ -1,0 +1,278 @@
+#!/usr/bin/env python3
+"""g2ctl — durable, idempotent orchestrator for the G2-on-Linux/NVIDIA stack.
+
+  g2ctl status            read-only: each component's drift vs the desired state
+  g2ctl verify            smoke checks (modules, monado, mutter hold, g2-studio)
+  g2ctl heal [--auto]     bring drifted components back in sync (idempotent);
+                          self-heals patch/rebase conflicts via Claude Code,
+                          rebuilds, and re-verifies. --auto = non-interactive.
+  g2ctl doctor            status -> heal -> verify
+
+Source of truth: infra/g2.manifest.toml (data only; logic lives here).
+Reuses scripts/ for NVIDIA. No external deps (tomllib is stdlib).
+Self-heal runs on a backup ref, is logged, verify-gated, and never pushes.
+"""
+from __future__ import annotations
+import argparse, datetime, os, shutil, subprocess, sys, tomllib
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+MANIFEST = HERE / "g2.manifest.toml"
+# Claude Code headless invocation for self-heal (override via $G2CTL_CLAUDE).
+CLAUDE = os.environ.get("G2CTL_CLAUDE", "claude").split()
+
+C_OK, C_WARN, C_ERR, C_OFF = "\033[32m", "\033[33m", "\033[31m", "\033[0m"
+if not sys.stdout.isatty():
+    C_OK = C_WARN = C_ERR = C_OFF = ""
+
+
+def load():
+    with open(MANIFEST, "rb") as f:
+        m = tomllib.load(f)
+    m["_ws"] = Path(m["meta"]["workspace"])
+    return m
+
+
+def sh(cmd, cwd=None, env=None, capture=True):
+    """Run a command list/str; return (rc, output). Never raises."""
+    r = subprocess.run(cmd, cwd=cwd, env={**os.environ, **(env or {})},
+                       shell=isinstance(cmd, str), text=True,
+                       stdout=subprocess.PIPE if capture else None,
+                       stderr=subprocess.STDOUT if capture else None)
+    return r.returncode, (r.stdout or "")
+
+
+def git(repo, *args):
+    rc, out = sh(["git", "-C", str(repo), *args])
+    return rc, out.strip()
+
+
+class Log:
+    def __init__(self, root):
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.dir = Path(root).expanduser() / ts
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.f = open(self.dir / "heal.log", "w")
+
+    def __call__(self, msg):
+        line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
+        print(line); self.f.write(line + "\n"); self.f.flush()
+
+
+# ── self-heal ──────────────────────────────────────────────────────────────
+def self_heal(repo, what, log):
+    """Ask Claude Code to resolve an in-progress patch/rebase conflict in `repo`
+    so it applies and builds. Returns True if it claims success. Backup-protected
+    and verify-gated by the caller; never pushes."""
+    if not shutil.which(CLAUDE[0]):
+        log(f"  self-heal unavailable ({CLAUDE[0]} not on PATH) — leaving conflict for you")
+        return False
+    prompt = (
+        f"You are resolving a git conflict in {repo} during an automated update of "
+        f"the G2-on-Linux/NVIDIA stack ({what}). Resolve the conflict markers so our "
+        f"patch set applies cleanly onto the new upstream code, preserving the intent "
+        f"of our changes (see the commit messages / patches/consolidated). Then stage "
+        f"the resolved files and continue the rebase/cherry-pick (git rebase --continue "
+        f"or git cherry-pick --continue). Do NOT push, do NOT amend unrelated commits, "
+        f"do NOT change anything outside resolving this conflict. Stop when the tree is "
+        f"conflict-free and the operation has continued.")
+    log(f"  invoking self-heal via {CLAUDE[0]} …")
+    rc, out = sh([*CLAUDE, "-p", prompt, "--permission-mode", "bypassPermissions",
+                  "--max-turns", "60"], cwd=str(repo))
+    (log.dir / "self-heal.out").write_text(out)
+    return rc == 0
+
+
+def priv_install(name, scripts, log, auto):
+    """Privileged install step. In --auto use the root-owned wrapper via passwordless
+    sudo (scoped in /etc/sudoers.d/g2ctl); otherwise the in-tree script (prompts)."""
+    wrapper = Path(f"/usr/local/sbin/g2ctl-{name}-install")
+    if auto and wrapper.exists():
+        rc, out = sh(["sudo", "-n", str(wrapper)])
+    elif name == "nvidia":
+        rc, out = sh([str(scripts / "nvidia-install-modules.sh")])   # self-sudoes
+    else:
+        rc, out = sh(["sudo", str(scripts / "mutter-install-debs.sh")])
+    log(out)
+    if rc != 0:
+        log(f"  {C_ERR}{name} install failed — run `sudo g2ctl heal` or infra/install.sh "
+            f"for scoped sudoers{C_OFF}")
+    return rc == 0
+
+
+# ── nvidia ─────────────────────────────────────────────────────────────────
+def nvidia_state(m, c):
+    repo = m["_ws"] / c["repo"]
+    _, branch = git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    _, base = git(repo, "describe", "--tags", "--abbrev=0")
+    built = repo / "kernel-open/nvidia-drm.ko"
+    bsrc = sh(["modinfo", "-F", "srcversion", str(built)])[1].strip() if built.exists() else ""
+    isrc = sh(["modinfo", "-F", "srcversion", "nvidia_drm"])[1].strip()
+    loaded = Path("/sys/module/nvidia/version")
+    drv = loaded.read_text().strip() if loaded.exists() else "(not loaded)"
+    dirty = bool(git(repo, "status", "--porcelain", "--untracked-files=no")[1])
+    drift = dirty or (bsrc and isrc and bsrc != isrc) or (base not in ("", drv) and drv != "(not loaded)")
+    return dict(branch=branch, base=base, built=bsrc, installed=isrc, driver=drv,
+                dirty=dirty, drift=drift)
+
+
+def nvidia_status(m, c):
+    s = nvidia_state(m, c)
+    tag = f"{C_WARN}DRIFT{C_OFF}" if s["drift"] else f"{C_OK}ok{C_OFF}"
+    print(f"  nvidia    [{tag}] branch={s['branch']} base={s['base']} "
+          f"driver={s['driver']} built={s['built'] or '-'} installed={s['installed'] or '-'}"
+          + ("  (tree dirty)" if s["dirty"] else ""))
+    return not s["drift"]
+
+
+def nvidia_heal(m, c, log, auto):
+    repo = m["_ws"] / c["repo"]; scripts = m["_ws"] / "scripts"
+    s = nvidia_state(m, c)
+    if not s["drift"]:
+        log("  nvidia: in sync"); return True
+    # 1. upstream driver moved past our base tag → rebase our patches onto it
+    if s["driver"] not in ("(not loaded)", "", s["base"]):
+        log(f"  nvidia: rebase patches {s['base']} -> {s['driver']}")
+        sh([str(scripts / "nvidia-fetch-upstream.sh")], cwd=str(repo))
+        rc, out = sh([str(scripts / "nvidia-rebase-onto.sh"), s["driver"]], cwd=str(repo)); log(out)
+        if rc == 3 and not (self_heal(repo, "NVIDIA patch rebase", log)
+                            and not git(repo, "status", "--porcelain", "-uno")[1]):
+            log(f"  {C_ERR}nvidia rebase conflict unresolved — left for review{C_OFF}"); return False
+    # 2. build only if the built module isn't already current for this kernel
+    built = repo / "kernel-open/nvidia-drm.ko"
+    vm = sh(["modinfo", "-F", "vermagic", str(built)])[1].split() if built.exists() else []
+    fresh = bool(vm) and vm[0] == os.uname().release and not s["dirty"]
+    if not fresh:
+        log("  nvidia: build modules")
+        rc, out = sh([str(scripts / "nvidia-build-modules.sh")], cwd=str(repo)); log(out[-3000:])
+        if rc: return False
+    # 3. privileged install (+ reboot reminder)
+    if not priv_install("nvidia", scripts, log, auto): return False
+    log(f"  {C_WARN}nvidia healed — REBOOT to load the new modules{C_OFF}")
+    return True
+
+
+# ── monado ─────────────────────────────────────────────────────────────────
+def monado_status(m, c):
+    ok = Path(c["binary"]).exists()
+    repo = m["_ws"] / c["repo"]
+    _, head = git(repo, "rev-parse", "--short", "HEAD")
+    dirty = bool(git(repo, "status", "--porcelain", "--untracked-files=no")[1])
+    tag = f"{C_OK}ok{C_OFF}" if ok else f"{C_WARN}MISSING{C_OFF}"
+    print(f"  monado    [{tag}] {c['binary']} head={head}" + ("  (tree dirty)" if dirty else ""))
+    return ok
+
+
+def monado_heal(m, c, log, auto):
+    repo = m["_ws"] / c["repo"]
+    bd = c["build_dir"]
+    log("  monado: ninja build + install")
+    rc, out = sh(["ninja", "-C", bd], cwd=str(repo)); log(out)
+    if rc: return False
+    rc, out = sh(["ninja", "-C", bd, "install"], cwd=str(repo)); log(out)
+    if rc: return False
+    # CAP_SYS_NICE so monado's threads get real-time scheduling (O-4); best-effort.
+    sh(["sudo", "setcap", "cap_sys_nice+ep", c["binary"]])
+    return True
+
+
+# ── mutter ─────────────────────────────────────────────────────────────────
+def mutter_state(c):
+    rc, out = sh(["dpkg-query", "-W", "-f=${Version}", "mutter"])
+    ver = out.strip()
+    held = c["holds"][0] in sh(["apt-mark", "showhold"])[1]
+    patched = c["marker"] in ver
+    return dict(version=ver, patched=patched, held=held, drift=not (patched and held))
+
+
+def mutter_status(m, c):
+    s = mutter_state(c)
+    tag = f"{C_WARN}DRIFT{C_OFF}" if s["drift"] else f"{C_OK}ok{C_OFF}"
+    print(f"  mutter    [{tag}] version={s['version'] or '-'} "
+          f"patched={s['patched']} held={s['held']}")
+    return not s["drift"]
+
+
+def mutter_heal(m, c, log, auto):
+    s = mutter_state(c)
+    if not s["drift"]:
+        log("  mutter: in sync"); return True
+    repo = m["_ws"] / c["repo"]; scripts = m["_ws"] / "scripts"
+    log("  mutter: dpkg-buildpackage (re-applies quilt series onto current source)")
+    rc, out = sh(["dpkg-buildpackage", "-b", "-uc", "-us"], cwd=str(repo)); log(out[-3000:])
+    if rc != 0:
+        if not self_heal(repo, "mutter quilt/build", log): return False
+        rc, out = sh(["dpkg-buildpackage", "-b", "-uc", "-us"], cwd=str(repo)); log(out[-3000:])
+        if rc != 0: return False
+    return priv_install("mutter", scripts, log, auto)
+
+
+# ── g2-studio ──────────────────────────────────────────────────────────────
+def g2studio_status(m, c):
+    repo = Path(c["repo"])
+    rc, _ = sh(["python3", "-c", f"import {c['module']}"], cwd=str(repo))
+    tag = f"{C_OK}ok{C_OFF}" if rc == 0 else f"{C_ERR}IMPORT FAIL{C_OFF}"
+    print(f"  g2-studio [{tag}] {repo} import {c['module']}")
+    return rc == 0
+
+
+def g2studio_heal(m, c, log, auto):
+    return g2studio_status(m, c)
+
+
+COMPONENTS = {
+    "nvidia":    (nvidia_status,   nvidia_heal),
+    "monado":    (monado_status,   monado_heal),
+    "mutter":    (mutter_status,   mutter_heal),
+    "g2-studio": (g2studio_status, g2studio_heal),
+}
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="g2ctl", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=["status", "verify", "heal", "doctor"])
+    ap.add_argument("--auto", action="store_true", help="non-interactive (for hooks)")
+    ap.add_argument("--component", help="limit to one component")
+    a = ap.parse_args()
+    m = load()
+    comps = {a.component: m["components"][a.component]} if a.component else m["components"]
+
+    if a.cmd in ("status", "verify"):
+        print(f"G2 stack — {a.cmd}:")
+        results = [COMPONENTS[name][0](m, c) for name, c in comps.items()]  # no short-circuit
+        sys.exit(0 if all(results) else 1)
+
+    if a.cmd == "doctor":
+        print("G2 stack — status:")
+        for name, c in comps.items():
+            COMPONENTS[name][0](m, c)
+        print()
+
+    if a.cmd in ("heal", "doctor"):
+        log = Log(m["meta"]["log_dir"])
+        log(f"heal start (auto={a.auto}) → {log.dir}")
+        results = {}
+        for name, c in comps.items():
+            log(f"== {name} ==")
+            try:
+                healed = COMPONENTS[name][1](m, c, log, a.auto)
+                # Verify-gate: only trust a heal that also verifies clean afterward
+                # (don't accept a privileged install on its return code alone).
+                verified = COMPONENTS[name][0](m, c) if healed else False
+                results[name] = bool(healed and verified)
+                if healed and not verified:
+                    log(f"  {C_ERR}{name}: heal ran but post-verify FAILED — not trusted{C_OFF}")
+            except Exception as e:
+                log(f"  {C_ERR}{name} heal error: {e}{C_OFF}"); results[name] = False
+        log("heal summary: " + ", ".join(
+            f"{n}={'ok' if r else 'FAIL'}" for n, r in results.items()))
+        # clear drift flag if everything healed
+        flag = Path(m["meta"]["log_dir"]).expanduser().parent / "drift"
+        if all(results.values()) and flag.exists():
+            flag.unlink()
+        sys.exit(0 if all(results.values()) else 1)
+
+
+if __name__ == "__main__":
+    main()

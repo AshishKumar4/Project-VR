@@ -1,0 +1,88 @@
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Wed, 20 May 2026 13:30:00 +0000
+Subject: [PATCH] wayland/outputs: skip output update when monitor has no logical_monitor
+
+meta_monitor_get_logical_monitor() can legitimately return NULL: see
+meta_monitor_update_outputs() in src/backends/meta-monitor.c, which calls
+meta_monitor_set_logical_monitor (monitor, NULL) on entry and only re-assigns
+the logical monitor when the rebuild completes.
+
+The Wayland-side on_monitors_changing handler (hooked to MONITORS_CHANGING
+emitted by meta_monitor_manager_notify_monitors_changed) fires from inside
+meta_monitor_manager_rebuild. It iterates monitors and calls send_output_events
+which dereferences the (potentially NULL) logical_monitor without checking,
+producing a SIGSEGV in meta_logical_monitor_get_layout.
+
+This is reliably reproducible with hot-pluggable VR HMDs whose EDID flaps under
+load (HP Reverb G2 on NVIDIA proprietary, where DP link-train retries cause
+nvidia-modeset to re-read EDID multiple times per second; each re-read triggers
+a kernel-side hotplug -> udev event -> mutter rebuild -> race window).
+
+The upstream pattern is shown in meta_monitor_manager_get_monitor_for_connector
+at src/backends/meta-monitor-manager.c:4205-4211 -- guard with
+meta_monitor_is_active (monitor) (or NULL-check the logical_monitor pointer)
+before dereferencing the logical_monitor side-band.
+
+Apply the same pattern here:
+  - send_output_events:               early return if logical_monitor NULL
+  - send_xdg_output_events:           early return if logical_monitor NULL
+  - meta_wayland_output_set_monitor:  don't overwrite cached layout/transform
+                                       with zeros; defer until rebuild completes
+
+The bind_output debug print (only used with WITH_VERBOSE_MODE) is unchanged
+because it prints logical_monitor as %p which is NULL-safe.
+
+When rebuild completes, meta_monitor_manager_notify_monitors_changed fires
+the signal chain again, and these handlers re-run with a valid logical_monitor.
+
+Forwarded: no
+Last-Update: 2026-05-20
+Index: mutter-50.1/src/wayland/meta-wayland-outputs.c
+===================================================================
+--- mutter-50.1.orig/src/wayland/meta-wayland-outputs.c
++++ mutter-50.1/src/wayland/meta-wayland-outputs.c
+@@ -250,6 +250,14 @@ send_output_events (struct wl_resource *
+   int old_mode_width, old_mode_height;
+   gboolean need_done = FALSE;
+ 
++  /* A rebuild can transiently leave the monitor with no logical_monitor
++   * (see meta_monitor_update_outputs() in meta-monitor.c). Skip sending
++   * stale/garbage geometry to clients -- the next rebuild emission will
++   * fire this handler again once the logical monitor is reassigned.
++   */
++  if (!logical_monitor)
++    return;
++
+   layout = meta_logical_monitor_get_layout (logical_monitor);
+   old_layout = wayland_output->layout;
+ 
+@@ -446,6 +454,16 @@ meta_wayland_output_set_monitor (MetaWay
+   wayland_output->monitor = monitor;
+ 
+   logical_monitor = meta_monitor_get_logical_monitor (monitor);
++
++  /* During a monitor-manager rebuild the monitor can be transiently
++   * disassociated from its logical_monitor (see meta_monitor_update_outputs
++   * in meta-monitor.c). Don't overwrite the cached layout/transform/scale
++   * with garbage values -- defer until rebuild completes and this is called
++   * again with a valid logical_monitor.
++   */
++  if (!logical_monitor)
++    return;
++
+   wayland_output->layout = meta_logical_monitor_get_layout (logical_monitor);
+   wayland_output->subpixel_order = meta_monitor_get_subpixel_order (monitor);
+   wayland_output->transform =
+@@ -706,6 +724,12 @@ send_xdg_output_events (struct wl_resour
+   MtkRectangle old_layout;
+   gboolean need_done = FALSE;
+ 
++  /* See send_output_events: a monitor-manager rebuild can transiently
++   * leave the monitor without a logical_monitor. Skip stale geometry.
++   */
++  if (!logical_monitor)
++    return;
++
+   layout = meta_logical_monitor_get_layout (logical_monitor);
+   old_layout = wayland_output->layout;
+ 

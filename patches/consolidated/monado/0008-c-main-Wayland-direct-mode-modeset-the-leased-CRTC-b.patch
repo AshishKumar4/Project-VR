@@ -1,0 +1,215 @@
+From f6655e450f5aef9fb74a2cfb20443d3629ec7548 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Thu, 21 May 2026 14:26:29 -0400
+Subject: [PATCH 08/10] =?UTF-8?q?c/main:=20Wayland=20direct=20mode=20?=
+ =?UTF-8?q?=E2=80=94=20modeset=20the=20leased=20CRTC=20before=20present?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+NVIDIA's Vulkan WSI does not implicitly modeset a DRM-leased CRTC on the first
+present, so the leased connector's CRTC stays inactive and vkQueuePresentKHR has
+no active scanout target. After vkAcquireDrmDisplayEXT, drive a spec-correct
+atomic modeset (CONN.CRTC_ID + CRTC.ACTIVE + CRTC.MODE_ID) on the leased fd:
+- pick the native mode (largest area, then highest refresh), not modes[0];
+- pick the CRTC routed to the leased connector (bound encoder, else a
+  possible_crtcs match within the lease), not blindly crtcs[0].
+
+Idempotent on drivers (Mesa/RADV) that already modeset implicitly on first
+present; required on the NVIDIA WSI path. Correct for any WMR/VR HMD.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../main/comp_window_direct_wayland.c         | 162 ++++++++++++++++++
+ 1 file changed, 162 insertions(+)
+
+diff --git a/src/xrt/compositor/main/comp_window_direct_wayland.c b/src/xrt/compositor/main/comp_window_direct_wayland.c
+index b91f877e2..2fdaa8804 100644
+--- a/src/xrt/compositor/main/comp_window_direct_wayland.c
++++ b/src/xrt/compositor/main/comp_window_direct_wayland.c
+@@ -17,6 +17,7 @@
+ #include <unistd.h>
+ #include <wayland-client.h>
+ #include <xf86drm.h>
++#include <xf86drmMode.h>
+ 
+ #include "drm-lease-v1-client-protocol.h"
+ #include "xrt/xrt_compiler.h"
+@@ -160,6 +161,161 @@ static const struct wp_drm_lease_v1_listener lease_listener = {
+     .finished = _lease_finished,
+ };
+ 
++/* Lessee modesets the leased CRTC before first present: compositors hand it
++ * over inactive per the wp_drm_lease_v1 contract. Mesa's WSI does this
++ * implicitly; NVIDIA's doesn't, leaving the CRTC dark on first present. */
++static int
++direct_wayland_find_prop_id(int fd, uint32_t object_id, uint32_t object_type, const char *name)
++{
++	int prop_id = -1;
++	drmModeObjectProperties *props = drmModeObjectGetProperties(fd, object_id, object_type);
++	if (props == NULL) {
++		return -1;
++	}
++	for (uint32_t i = 0; i < props->count_props; i++) {
++		drmModePropertyRes *p = drmModeGetProperty(fd, props->props[i]);
++		if (p == NULL) {
++			continue;
++		}
++		if (strcmp(p->name, name) == 0) {
++			prop_id = (int)p->prop_id;
++		}
++		drmModeFreeProperty(p);
++		if (prop_id >= 0) {
++			break;
++		}
++	}
++	drmModeFreeObjectProperties(props);
++	return prop_id;
++}
++
++/* Choose the CRTC routed to (or able to drive) the leased connector. Prefer the
++ * connector's bound encoder/CRTC; else the first lease CRTC in possible_crtcs;
++ * else crtcs[0]. */
++static uint32_t
++direct_wayland_pick_crtc(int fd, drmModeConnector *conn, drmModeRes *res)
++{
++	uint32_t crtc_id = 0;
++	drmModeEncoder *enc = NULL;
++
++	if (conn->encoder_id != 0) {
++		enc = drmModeGetEncoder(fd, conn->encoder_id);
++	}
++	for (int ei = 0; enc == NULL && ei < conn->count_encoders; ei++) {
++		enc = drmModeGetEncoder(fd, conn->encoders[ei]);
++	}
++	if (enc != NULL) {
++		if (enc->crtc_id != 0) {
++			crtc_id = enc->crtc_id;
++		} else {
++			for (int ci = 0; ci < res->count_crtcs; ci++) {
++				if (enc->possible_crtcs & (1u << ci)) {
++					crtc_id = res->crtcs[ci];
++					break;
++				}
++			}
++		}
++		drmModeFreeEncoder(enc);
++	}
++	if (crtc_id == 0) {
++		crtc_id = res->crtcs[0];
++	}
++	return crtc_id;
++}
++
++static int
++direct_wayland_lessee_modeset(struct comp_window_direct_wayland *w)
++{
++	int fd = w->lease->leased_fd;
++	int rc = -1;
++	drmModeConnector *conn = NULL;
++	drmModeRes *res = NULL;
++	drmModeAtomicReq *req = NULL;
++	uint32_t mode_blob_id = 0;
++	drmModeModeInfo *mode = NULL;
++	int conn_crtc_id_prop, crtc_active_prop, crtc_mode_id_prop;
++	uint32_t crtc_id;
++
++	/* Lessees inherit non-atomic master; opt in (Mesa convention). */
++	(void)drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1);
++
++	conn = drmModeGetConnector(fd, w->selected_connector->id);
++	if (conn == NULL || conn->count_modes == 0) {
++		COMP_ERROR(w->base.base.c, "lessee modeset: no modes on leased connector %u",
++		           w->selected_connector->id);
++		goto out;
++	}
++	/* Pick the native mode: largest area, then highest refresh (modes[0] is not
++	 * guaranteed native on every HMD). */
++	mode = &conn->modes[0];
++	for (int mi = 1; mi < conn->count_modes; mi++) {
++		drmModeModeInfo *cand = &conn->modes[mi];
++		uint32_t cand_area = (uint32_t)cand->hdisplay * (uint32_t)cand->vdisplay;
++		uint32_t best_area = (uint32_t)mode->hdisplay * (uint32_t)mode->vdisplay;
++		if (cand_area > best_area ||
++		    (cand_area == best_area && cand->vrefresh > mode->vrefresh)) {
++			mode = cand;
++		}
++	}
++
++	res = drmModeGetResources(fd);
++	if (res == NULL || res->count_crtcs == 0) {
++		COMP_ERROR(w->base.base.c, "lessee modeset: no CRTCs in lease (res=%p count=%d)",
++		           (void *)res, res ? res->count_crtcs : -1);
++		goto out;
++	}
++	/* Use the CRTC routed to the leased connector, not blindly crtcs[0]. */
++	crtc_id = direct_wayland_pick_crtc(fd, conn, res);
++
++	conn_crtc_id_prop = direct_wayland_find_prop_id(fd, conn->connector_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
++	crtc_active_prop = direct_wayland_find_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC, "ACTIVE");
++	crtc_mode_id_prop = direct_wayland_find_prop_id(fd, crtc_id, DRM_MODE_OBJECT_CRTC, "MODE_ID");
++	if (conn_crtc_id_prop < 0 || crtc_active_prop < 0 || crtc_mode_id_prop < 0) {
++		COMP_ERROR(w->base.base.c, "lessee modeset: missing atomic properties (conn.CRTC_ID=%d crtc.ACTIVE=%d crtc.MODE_ID=%d)",
++		           conn_crtc_id_prop, crtc_active_prop, crtc_mode_id_prop);
++		goto out;
++	}
++
++	if (drmModeCreatePropertyBlob(fd, mode, sizeof(*mode), &mode_blob_id) != 0) {
++		COMP_ERROR(w->base.base.c, "lessee modeset: drmModeCreatePropertyBlob: %s", strerror(errno));
++		goto out;
++	}
++
++	req = drmModeAtomicAlloc();
++	if (req == NULL) {
++		goto out;
++	}
++	if (drmModeAtomicAddProperty(req, conn->connector_id, (uint32_t)conn_crtc_id_prop, crtc_id) < 0 ||
++	    drmModeAtomicAddProperty(req, crtc_id, (uint32_t)crtc_active_prop, 1) < 0 ||
++	    drmModeAtomicAddProperty(req, crtc_id, (uint32_t)crtc_mode_id_prop, mode_blob_id) < 0) {
++		COMP_ERROR(w->base.base.c, "lessee modeset: drmModeAtomicAddProperty failed");
++		goto out;
++	}
++
++	rc = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
++	if (rc != 0) {
++		COMP_ERROR(w->base.base.c, "lessee modeset: drmModeAtomicCommit: %s (rc=%d, errno=%d=%s)",
++		           strerror(-rc), rc, errno, strerror(errno));
++		goto out;
++	}
++
++	COMP_INFO(w->base.base.c, "Lessee modeset OK: CRTC %u active with mode %ux%u@%u",
++	          crtc_id, mode->hdisplay, mode->vdisplay, mode->vrefresh);
++
++out:
++	if (req != NULL) {
++		drmModeAtomicFree(req);
++	}
++	if (res != NULL) {
++		drmModeFreeResources(res);
++	}
++	if (conn != NULL) {
++		drmModeFreeConnector(conn);
++	}
++	/* Intentionally do NOT destroy mode_blob_id on success: CRTC.MODE_ID references it. */
++	return rc;
++}
++
+ static VkResult
+ comp_window_direct_wayland_create_surface(struct comp_window_direct_wayland *w,
+                                           VkSurfaceKHR *surface,
+@@ -188,6 +344,12 @@ comp_window_direct_wayland_create_surface(struct comp_window_direct_wayland *w,
+ 		return ret;
+ 	}
+ 
++	/* Spec-correct lessee modeset; idempotent on drivers (Mesa/RADV) that
++	 * already do it implicitly on first present. */
++	if (direct_wayland_lessee_modeset(w) != 0) {
++		COMP_WARN(w->base.base.c, "Lessee modeset failed; present may fail");
++	}
++
+ 	ret = comp_window_direct_create_surface(&w->base, w->vk_display, width, height);
+ 	if (ret != VK_SUCCESS) {
+ 		COMP_ERROR(w->base.base.c, "Failed to create surface: %s", vk_result_string(ret));
+-- 
+2.53.0
+

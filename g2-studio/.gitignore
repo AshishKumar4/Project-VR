@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# Runtime state: heal logs, drift flag, caches.
+/var/

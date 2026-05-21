@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>G2 Studio — VR Configurator</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script>
+    tailwind.config = { darkMode: 'class', theme: { extend: { colors: {
+      brand: { 50:'#f0fdfa',500:'#14b8a6',600:'#0d9488',700:'#0f766e',800:'#115e59',900:'#134e4a' },
+      ink: { 800:'#0b1220',900:'#070d18',950:'#04080f' },
+    }}}};
+  </script>
+  <style>
+    body { background: #04080f; color: #e2e8f0; font-family: ui-sans-serif, system-ui, sans-serif; }
+    .card { background: #0b1220; border: 1px solid #1e293b; border-radius: 12px; padding: 1.25rem; }
+    .pill-on { background:#134e4a;color:#5eead4;border:1px solid #14b8a6; }
+    .pill-off { background:#1e1b1b;color:#fca5a5;border:1px solid #ef4444; }
+    .pill-warn { background:#27291b;color:#fde68a;border:1px solid #eab308; }
+    .pill-neutral { background:#1e293b;color:#cbd5e1;border:1px solid #334155; }
+    .btn { font-weight:600;border-radius:8px;padding:.6rem 1rem;transition:all .15s; cursor: pointer; user-select:none; border:1px solid transparent; }
+    .btn-primary { background:#0d9488;color:#fff; }
+    .btn-primary:hover { background:#0f766e; }
+    .btn-danger { background:#b91c1c;color:#fff; }
+    .btn-danger:hover { background:#991b1b; }
+    .btn-secondary { background:#1e293b;color:#e2e8f0; border-color:#334155; }
+    .btn-secondary:hover { background:#334155; }
+    .btn:disabled { opacity:.4; cursor: not-allowed; }
+    .label { font-size:.78rem; text-transform: uppercase; letter-spacing:.04em; color:#64748b; }
+    .mono { font-family: ui-monospace, "JetBrains Mono", "Fira Code", monospace; font-size:.85rem; }
+    input[type="text"], input[type="number"], select {
+      background:#0b1220;border:1px solid #334155;border-radius:6px;
+      padding:.4rem .6rem;color:#e2e8f0;font-family:ui-monospace,monospace;font-size:.9rem;
+    }
+    input:focus, select:focus { outline:none; border-color:#14b8a6; }
+    .toggle { position:relative;display:inline-block;width:42px;height:22px; }
+    .toggle input { display:none; }
+    .toggle-slider { position:absolute;cursor:pointer;inset:0;background:#334155;border-radius:34px;transition:.2s; }
+    .toggle-slider:before { content:"";position:absolute;height:16px;width:16px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s; }
+    .toggle input:checked + .toggle-slider { background:#14b8a6; }
+    .toggle input:checked + .toggle-slider:before { transform:translateX(20px); }
+    .log { font-family:ui-monospace,monospace;font-size:.78rem;line-height:1.4;
+      background:#04080f;border:1px solid #1e293b;border-radius:6px;padding:.75rem;
+      max-height:24rem;overflow:auto;white-space:pre-wrap;}
+    .grid-2 { display:grid;grid-template-columns: 1fr 1fr;gap:.75rem; }
+    .pill { padding:.18rem .55rem; border-radius: 999px; font-size: .78rem; font-weight: 600; }
+    h1 { font-weight: 700; letter-spacing:-.02em; }
+    h2 { font-weight: 600; letter-spacing:-.01em; }
+    .status-dot { width:10px;height:10px;border-radius:50%;display:inline-block; }
+    details summary { cursor: pointer; list-style: none; }
+    details summary::-webkit-details-marker { display: none; }
+    .accent { color: #5eead4; }
+    .muted { color: #64748b; }
+  </style>
+</head>
+
+<body x-data="g2studio()" x-init="init()">
+
+<header class="border-b border-slate-800 px-6 py-4 bg-ink-900 sticky top-0 z-10">
+  <div class="flex items-center justify-between max-w-7xl mx-auto">
+    <div class="flex items-baseline gap-3">
+      <h1 class="text-2xl">G2 Studio</h1>
+      <span class="muted text-sm">HP Reverb G2 on Linux NVIDIA — runtime configurator</span>
+    </div>
+    <div class="flex gap-2 items-center text-sm">
+      <span class="pill" :class="status.monado?.running ? 'pill-on' : 'pill-off'">
+        <span class="status-dot" :class="status.monado?.running ? 'bg-teal-400' : 'bg-red-400'"></span>
+        Monado <span x-text="status.monado?.running ? 'running' : 'stopped'"></span>
+      </span>
+      <span class="pill" :class="hmdAlive ? 'pill-on' : 'pill-warn'">
+        <span class="status-dot" :class="hmdAlive ? 'bg-teal-400' : 'bg-yellow-400'"></span>
+        HMD <span x-text="hmdAlive ? 'detected' : 'idle/missing'"></span>
+      </span>
+      <span class="pill" :class="status.kmod?.is_patched_build ? 'pill-on' : 'pill-warn'">
+        kmod <span x-text="status.kmod?.is_patched_build ? 'patched' : 'stock'"></span>
+      </span>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto p-6 grid grid-cols-12 gap-5">
+
+  <!-- Quick Actions -->
+  <section class="col-span-12 card">
+    <h2 class="text-lg mb-3 flex items-center gap-2">
+      <span class="accent">⚡</span> Quick Actions
+    </h2>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-2">
+      <button class="btn btn-primary" @click="startVR()" :disabled="status.monado?.running">
+        ▶ Start VR session
+      </button>
+      <button class="btn btn-danger" @click="stopVR()" :disabled="!status.monado?.running">
+        ■ Stop &amp; restore
+      </button>
+      <button class="btn btn-secondary" @click="applyGpuOptim()">
+        ⚙ Apply GPU optimizations
+      </button>
+      <button class="btn btn-secondary" @click="refresh()">
+        ↻ Refresh status
+      </button>
+    </div>
+    <p class="muted text-sm mt-3">
+      <strong>Start VR session</strong> runs: <span class="mono">xrandr non-desktop=1, --off → monado-service with current config</span>.
+      Your desktop monitors stay alive. Headset becomes the VR target.
+    </p>
+  </section>
+
+  <!-- Hardware status -->
+  <section class="col-span-12 lg:col-span-6 card">
+    <h2 class="text-lg mb-3 flex items-center gap-2">
+      <span class="accent">🖥</span> Hardware
+    </h2>
+    <div class="grid-2 text-sm">
+      <div>
+        <div class="label">GPU</div>
+        <div class="mono" x-text="status.gpu?.name || '—'"></div>
+        <div class="muted text-xs">Driver <span x-text="status.gpu?.driver || '?'"></span></div>
+      </div>
+      <div>
+        <div class="label">Power / Util</div>
+        <div class="mono"><span x-text="(status.gpu?.power_w || 0).toFixed(1)"></span> W / <span x-text="status.gpu?.util_gpu || 0"></span>% GPU</div>
+        <div class="muted text-xs"><span x-text="status.gpu?.clock_gr_mhz || 0"></span> MHz / <span x-text="status.gpu?.temp_c || 0"></span>°C</div>
+      </div>
+      <div>
+        <div class="label">Persistence</div>
+        <div><span class="pill" :class="status.gpu?.persistence ? 'pill-on' : 'pill-warn'">
+          <span x-text="status.gpu?.persistence ? 'on' : 'off'"></span>
+        </span></div>
+      </div>
+      <div>
+        <div class="label">VRAM</div>
+        <div class="mono"><span x-text="status.gpu?.mem_used_mib || 0"></span> / <span x-text="status.gpu?.mem_total_mib || 0"></span> MiB</div>
+      </div>
+    </div>
+
+    <div class="mt-4">
+      <div class="label">G2 USB Devices</div>
+      <div class="flex flex-wrap gap-1 mt-1">
+        <template x-for="(d, id) in status.usb" :key="id">
+          <span class="pill" :class="d.present ? 'pill-on' : 'pill-off'"
+                :title="d.name">
+            <span class="mono" x-text="id"></span>
+          </span>
+        </template>
+      </div>
+    </div>
+
+    <div class="mt-4">
+      <div class="label">X Outputs</div>
+      <div class="flex flex-wrap gap-1 mt-1">
+        <template x-for="o in status.xrandr?.outputs || []" :key="o.name">
+          <span class="pill" :class="o.connected ? 'pill-on' : 'pill-neutral'">
+            <span class="mono" x-text="o.name"></span>
+          </span>
+        </template>
+      </div>
+    </div>
+
+    <div class="mt-4 text-sm">
+      <span class="label">HMD non-desktop:</span>
+      <span class="pill ml-2" :class="status.xrandr?.hmd_nondesktop === 1 ? 'pill-on' : 'pill-warn'">
+        <span x-text="status.xrandr?.hmd_nondesktop ?? '—'"></span>
+      </span>
+      <span class="label ml-4">Patched module:</span>
+      <span class="pill ml-2" :class="status.kmod?.is_patched_build ? 'pill-on' : 'pill-warn'">
+        <span x-text="status.kmod?.is_patched_build ? 'YES' : 'stock'"></span>
+      </span>
+    </div>
+  </section>
+
+  <!-- Display controls -->
+  <section class="col-span-12 lg:col-span-6 card">
+    <h2 class="text-lg mb-3 flex items-center gap-2">
+      <span class="accent">🖼</span> Display (xrandr)
+    </h2>
+    <p class="muted text-sm mb-3">Manual HMD output workflow. Most users want the quick action above instead.</p>
+    <div class="grid grid-cols-2 gap-2">
+      <button class="btn btn-secondary" @click="displayOp('non_desktop_1')">non-desktop = 1</button>
+      <button class="btn btn-secondary" @click="displayOp('non_desktop_0')">non-desktop = 0</button>
+      <button class="btn btn-secondary" @click="displayOp('off')">DP-4 --off</button>
+      <button class="btn btn-secondary" @click="displayOp('auto')">DP-4 --auto</button>
+      <button class="btn btn-primary col-span-2" @click="displayOp('vr_prep')">VR prep (non-desktop=1 + off)</button>
+      <button class="btn btn-danger col-span-2" @click="displayOp('vr_restore')">Desktop restore (auto + non-desktop=0)</button>
+    </div>
+  </section>
+
+  <!-- Monado config -->
+  <section class="col-span-12 card">
+    <h2 class="text-lg mb-3 flex items-center gap-2">
+      <span class="accent">🥽</span> Monado runtime config
+    </h2>
+    <div class="grid md:grid-cols-3 gap-3">
+      <template x-for="(val, key) in monadoConfig" :key="key">
+        <div>
+          <div class="label" x-text="key.replace('XRT_', '').replaceAll('_', ' ')"></div>
+          <input class="w-full" type="text" x-model="monadoConfig[key]">
+        </div>
+      </template>
+    </div>
+
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-4">
+      <button class="btn btn-primary" @click="startMonado()" :disabled="status.monado?.running">▶ Start monado</button>
+      <button class="btn btn-danger" @click="stopMonado()" :disabled="!status.monado?.running">■ Stop monado</button>
+      <button class="btn btn-secondary" @click="resetMonadoConfig()">↺ Reset to defaults</button>
+      <select class="bg-ink-900" x-model="selectedProfile" @change="loadProfile()">
+        <option value="">— load profile —</option>
+        <template x-for="p in profileList" :key="p"><option :value="p" x-text="p"></option></template>
+      </select>
+    </div>
+    <div class="flex gap-2 mt-2">
+      <input type="text" placeholder="new profile name" x-model="newProfileName" class="flex-1">
+      <button class="btn btn-secondary" @click="saveProfile()" :disabled="!newProfileName">💾 Save current config</button>
+    </div>
+  </section>
+
+  <!-- GPU controls -->
+  <section class="col-span-12 lg:col-span-5 card">
+    <h2 class="text-lg mb-3 flex items-center gap-2">
+      <span class="accent">⚙</span> GPU
+    </h2>
+    <div class="grid grid-cols-2 gap-2">
+      <button class="btn btn-secondary" @click="gpuOp('persistence_on')">Persistence ON</button>
+      <button class="btn btn-secondary" @click="gpuOp('persistence_off')">Persistence OFF</button>
+      <button class="btn btn-secondary" @click="gpuOp('lock_clocks')">Lock clocks 2400-2820</button>
+      <button class="btn btn-secondary" @click="gpuOp('reset_clocks')">Reset clocks</button>
+      <button class="btn btn-primary col-span-2" @click="gpuOp('apply_vr')">Apply VR-optimized settings</button>
+      <button class="btn btn-danger col-span-2" @click="gpuOp('revert')">Revert</button>
+    </div>
+  </section>
+
+  <!-- Live log -->
+  <section class="col-span-12 lg:col-span-7 card">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-lg flex items-center gap-2">
+        <span class="accent">📋</span> Monado live log
+      </h2>
+      <div class="flex gap-2 text-sm">
+        <label class="flex gap-1 items-center"><input type="checkbox" x-model="autoscroll"> auto-scroll</label>
+        <button class="btn btn-secondary text-xs" @click="logLines=''">clear</button>
+      </div>
+    </div>
+    <div class="log" id="log" x-text="logLines"></div>
+  </section>
+
+</main>
+
+<footer class="muted text-center text-xs py-6">
+  G2 Studio · Localhost runtime configurator · Connected to: <span class="mono">localhost:8765</span>
+</footer>
+
+<script>
+function g2studio() {
+  return {
+    status: {},
+    monadoConfig: {},
+    defaults: {},
+    profileList: [],
+    selectedProfile: '',
+    newProfileName: '',
+    logLines: '',
+    autoscroll: true,
+    pollHandle: null,
+    ws: null,
+
+    async init() {
+      this.defaults = await (await fetch('/api/monado/config')).json();
+      this.monadoConfig = {...this.defaults};
+      await this.refresh();
+      await this.loadProfileList();
+      this.pollHandle = setInterval(() => this.refresh(), 2500);
+      this.connectLogs();
+    },
+
+    async refresh() {
+      try { this.status = await (await fetch('/api/status')).json(); }
+      catch(e) { console.warn('refresh failed', e); }
+    },
+
+    get hmdAlive() {
+      const u = this.status.usb || {};
+      return Object.values(u).every(v => v.present);
+    },
+
+    connectLogs() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      this.ws = new WebSocket(`${proto}//${location.host}/ws/logs`);
+      this.ws.onmessage = (e) => {
+        this.logLines += e.data;
+        if (this.logLines.length > 50000) this.logLines = this.logLines.slice(-40000);
+        if (this.autoscroll) this.$nextTick(() => {
+          const el = document.getElementById('log');
+          if (el) el.scrollTop = el.scrollHeight;
+        });
+      };
+      this.ws.onclose = () => setTimeout(() => this.connectLogs(), 1000);
+    },
+
+    async startMonado() {
+      const r = await (await fetch('/api/monado/start', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({config: this.monadoConfig, nice: -10})
+      })).json();
+      if (!r.ok) alert(r.msg || 'Failed to start');
+      await this.refresh();
+    },
+
+    async stopMonado() {
+      await fetch('/api/monado/stop', {method:'POST'});
+      await this.refresh();
+    },
+
+    async displayOp(op) {
+      const r = await (await fetch('/api/display/op', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({op})
+      })).json();
+      if (!r.ok) console.warn('display op failed', r);
+      setTimeout(() => this.refresh(), 500);
+    },
+
+    async gpuOp(op) {
+      await fetch('/api/gpu/op', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({op})
+      });
+      setTimeout(() => this.refresh(), 500);
+    },
+
+    async applyGpuOptim() { await this.gpuOp('apply_vr'); },
+
+    async startVR() {
+      // Combo: prep display + start monado
+      await this.displayOp('vr_prep');
+      await new Promise(r => setTimeout(r, 1200));
+      await this.startMonado();
+    },
+
+    async stopVR() {
+      await this.stopMonado();
+      await new Promise(r => setTimeout(r, 700));
+      await this.displayOp('vr_restore');
+    },
+
+    resetMonadoConfig() { this.monadoConfig = {...this.defaults}; },
+
+    async loadProfileList() {
+      const r = await (await fetch('/api/profiles')).json();
+      this.profileList = r.profiles || [];
+    },
+
+    async loadProfile() {
+      if (!this.selectedProfile) return;
+      const r = await (await fetch(`/api/profiles/${this.selectedProfile}`)).json();
+      this.monadoConfig = {...this.defaults, ...r};
+    },
+
+    async saveProfile() {
+      if (!this.newProfileName) return;
+      await fetch('/api/profiles/save', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name: this.newProfileName, config: this.monadoConfig})
+      });
+      this.newProfileName = '';
+      await this.loadProfileList();
+    },
+  };
+}
+</script>
+
+</body></html>

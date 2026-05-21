@@ -1,0 +1,8 @@
+# g2ctl scoped privileges — unattended heal install steps only.
+# Targets are ROOT-OWNED wrappers in /usr/local/sbin (not user-writable), so this
+# rule cannot be widened by editing a script in the user's tree.
+# NOTE: installing kernel modules / system debs is inherently root-equivalent;
+# this scopes *which* operations run without a password, not their power.
+# Installed to /etc/sudoers.d/g2ctl by install.sh and validated with `visudo -c`.
+mrwhite0racle ALL=(root) NOPASSWD: /usr/local/sbin/g2ctl-nvidia-install
+mrwhite0racle ALL=(root) NOPASSWD: /usr/local/sbin/g2ctl-mutter-install

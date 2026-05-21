@@ -1,0 +1,404 @@
+From 680b0056b06c3e2c558ae328381b0d0dae1cd1ef Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Thu, 21 May 2026 16:21:32 -0400
+Subject: [PATCH 09/10] a/t: robustify controller Kalman fusion against
+ IMU/optical outliers
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Tracking drift/jitter fix — two root causes of visible jumps:
+- A single corrupt IMU sample (MEMS glitch / dropped USB packet) with an
+  impossible angular rate was integrated raw, then tripped the post-correct
+  check that wiped the ENTIRE filter (position+orientation+velocity+bias) on one
+  bad reading. Now sanity-gate the raw gyro/accel (physical caps + finiteness),
+  skip a lone outlier (filter preserved), reset only on a sustained run.
+- A divergent constellation/LED pose (mislabelled-blob solution metres off) that
+  passed its own per-LED reprojection score had no jump gate and jerked tracking.
+  Now reject (don't reset) an optical pose that jumps farther from the last
+  anchor than a controller could travel (12 m/s * dt + 0.5 m slack), via a
+  3-state PoseResult so a rejected candidate leaves the filter + anchor intact.
+
+Tests: +3 cases; full suite 23 cases / 609 assertions pass. Conservative
+thresholds + felt quality pending in-headset confirmation.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../tracking/t_tracker_kalman_fusion.cpp      | 131 ++++++++++++++--
+ tests/tests_kalman_fusion.cpp                 | 147 ++++++++++++++++++
+ 2 files changed, 261 insertions(+), 17 deletions(-)
+
+diff --git a/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp b/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
+index a8428d997..4d10974f7 100644
+--- a/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
++++ b/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
+@@ -280,7 +280,15 @@ namespace {
+ 		void
+ 		get_prediction(const timepoint_ns when_ns, struct xrt_space_relation *out_relation) override;
+ 
+-		bool
++		//! Outcome of integrating an optical pose.
++		enum class PoseResult
++		{
++			ACCEPTED, //!< Applied as a correction; update the anchor.
++			REJECTED, //!< Implausible candidate skipped; filter untouched.
++			RESET,    //!< Catastrophic; filter was reset.
++		};
++
++		PoseResult
+ 		integrate_pose(const xrt_pose &pose,
+ 		               const Vector3d &pos_variance,
+ 		               const Vector3d &orient_variance,
+@@ -298,6 +306,22 @@ namespace {
+ 		//! Position dead-reckoning is trusted only this long after the last
+ 		//! optical pose; past it get_prediction freezes the position.
+ 		static constexpr int64_t OPTICAL_FREEZE_NS = 500 * 1000 * 1000; // 0.5 s
++		//! Physical sanity cap on a single gyro sample (~7200 deg/s = 20
++		//! rev/s). A real controller never spins this fast; anything above
++		//! is a glitch sample to reject, not motion to integrate.
++		static constexpr double MAX_GYRO_RAD_PER_SEC = 20.0 * double(EIGEN_PI) * 2;
++		//! Physical sanity cap on a single accel sample (~16 g, the full
++		//! scale of a typical controller MEMS accelerometer).
++		static constexpr double MAX_ACCEL_M_S2 = 16.0 * MATH_GRAVITY_M_S2;
++		//! How many consecutive outlier IMU samples before we treat it as a
++		//! real fault and reset, rather than a lone glitch we can skip.
++		static constexpr int IMU_ANOMALY_RESET_RUN = 10;
++		//! Fastest a hand-held controller plausibly moves; used to bound how
++		//! far an optical pose may jump from the last anchor in elapsed time.
++		static constexpr double OPTICAL_MAX_SPEED_M_S = 12.0;
++		//! Fixed slack on the optical jump gate for genuine fast motion and
++		//! re-acquisition latency, on top of speed * elapsed-time.
++		static constexpr double OPTICAL_JUMP_SLACK_M = 0.5;
+ 
+ 		void
+ 		reset_filter();
+@@ -333,6 +357,10 @@ namespace {
+ 		TrackingInfo orientation_state;
+ 		TrackingInfo position_state;
+ 
++		//! Run length of consecutive anomalous IMU samples. A lone glitch
++		//! is skipped; a sustained run forces a reset (see integrate_imu_sample).
++		int m_imu_anomaly_count{0};
++
+ 		//! Timestamp of the last optical pose integrated, and the fused
+ 		//! position at that moment. Used to freeze the reported position
+ 		//! once optical tracking has been lost long enough that IMU
+@@ -450,9 +478,10 @@ namespace {
+ 	{
+ 		reset_filter();
+ 		orientation_state = TrackingInfo{};
++		m_imu_anomaly_count = 0;
+ 	}
+ 
+-	bool
++	KalmanFusion::PoseResult
+ 	KalmanFusion::integrate_pose(const xrt_pose &pose,
+ 	                             const Vector3d &pos_variance,
+ 	                             const Vector3d &orient_variance,
+@@ -461,6 +490,36 @@ namespace {
+ 		Vector3d pos = map_vec3(pose.position).cast<double>();
+ 		Quaterniond orient = map_quat(pose.orientation).cast<double>();
+ 
++		// Reject a non-finite optical pose outright; never feed it.
++		if (!pos.allFinite() || !std::isfinite(orient.norm())) {
++			U_LOG_W("Optical pose is non-finite, rejecting candidate");
++			return PoseResult::REJECTED;
++		}
++
++		// Position-jump plausibility gate. The constellation/LED matcher can
++		// emit a wildly wrong pose (a mislabelled-blob solution) that still
++		// passes its own per-LED reprojection score — e.g. a candidate
++		// metres away from where the controller physically is. Such a pose,
++		// if integrated, jerks tracking. Reject (don't reset) any optical
++		// pose that jumps further from the last optically-anchored position
++		// than a controller could physically travel in the elapsed time,
++		// plus a fixed slack for genuine fast motion and re-acquisition.
++		if (tracked && last_optical_ns != 0) {
++			double dt = time_ns_to_s(filter_time_ns - last_optical_ns);
++			if (dt < 0.0) {
++				dt = 0.0;
++			}
++			double max_jump = OPTICAL_MAX_SPEED_M_S * dt + OPTICAL_JUMP_SLACK_M;
++			double jump = (pos - last_good_position).norm();
++			if (jump > max_jump) {
++				U_LOG_W(
++				    "Optical pose jumped %.3f m (limit %.3f m over %.3f s) - "
++				    "rejecting divergent candidate",
++				    jump, max_jump, dt);
++				return PoseResult::REJECTED;
++			}
++		}
++
+ 		auto pos_meas = AbsolutePositionLeverArmMeasurement{pos, slam_pose_offset, pos_variance};
+ 		auto orient_meas = AbsoluteOrientationMeasurement{orient, orient_variance};
+ 
+@@ -473,11 +532,14 @@ namespace {
+ 			    "filter state",
+ 			    pos_resid);
+ 			reset_filter();
+-			return false;
++			return PoseResult::RESET;
+ 		}
+ 
+-		return flexkalman::correctUnscented(filter_state, orient_meas) &&
+-		       flexkalman::correctUnscented(filter_state, pos_meas);
++		if (flexkalman::correctUnscented(filter_state, orient_meas) &&
++		    flexkalman::correctUnscented(filter_state, pos_meas)) {
++			return PoseResult::ACCEPTED;
++		}
++		return PoseResult::RESET; // non-finite correction; caller resets
+ 	}
+ 
+ 	bool
+@@ -489,9 +551,43 @@ namespace {
+ 		// AccelerometerMeasurement model predicts body-frame specific force
+ 		// directly, so this must NOT be pre-rotated into the world frame.
+ 		Vector3d acc = map_vec3_f64(sample.accel_m_s2);
++		// Raw body-frame gyro before world rotation, for outlier gating.
++		Vector3d gyro_body = map_vec3_f64(sample.gyro_rad_secs);
++
++		// Glitch rejection: a consumer MEMS controller IMU occasionally
++		// emits a single corrupt sample (bit error, dropped/duplicated
++		// packet) with a physically impossible angular rate. Feeding it to
++		// the filter corrupts the state and trips the post-correct sanity
++		// check, which used to wipe the *entire* filter — destroying
++		// position, orientation, velocity and bias on one bad reading and
++		// causing a visible jump. Instead, drop the gyro of a lone outlier
++		// and keep going; only a sustained run of anomalies (a real fault,
++		// not a glitch) forces a reset. A real controller never exceeds a
++		// few revolutions/sec, so MAX is well above any genuine motion.
++		bool gyro_outlier = !gyro_body.allFinite() ||
++		                    gyro_body.squaredNorm() > MAX_GYRO_RAD_PER_SEC * MAX_GYRO_RAD_PER_SEC;
++		bool accel_outlier = !acc.allFinite() || acc.squaredNorm() > MAX_ACCEL_M_S2 * MAX_ACCEL_M_S2;
++
++		if (gyro_outlier || accel_outlier) {
++			if (++m_imu_anomaly_count >= IMU_ANOMALY_RESET_RUN) {
++				U_LOG_E(
++				    "Sustained anomalous IMU samples (%d in a row) - "
++				    "resetting filter and IMU fusion!",
++				    m_imu_anomaly_count);
++				reset_filter_and_imu();
++				m_imu_anomaly_count = 0;
++			} else {
++				// Lone glitch: skip this sample, preserve tracking.
++				U_LOG_W("Rejected outlier IMU sample (glitch %d/%d), keeping filter",
++				        m_imu_anomaly_count, IMU_ANOMALY_RESET_RUN);
++			}
++			return true;
++		}
++		m_imu_anomaly_count = 0; // a good sample breaks any anomaly run
++
+ 		// Gyro is rotated into the world frame to match the state's
+ 		// angularVelocity(), which BiasedGyroMeasurement compares against.
+-		Vector3d gyro = filter_state.getQuaternion() * map_vec3_f64(sample.gyro_rad_secs);
++		Vector3d gyro = filter_state.getQuaternion() * gyro_body;
+ 
+ 		auto acc_meas = AccelerometerMeasurement{acc, G, accel_variance};
+ 		auto gyro_meas = BiasedGyroMeasurement{gyro, gyro_variance};
+@@ -504,12 +600,13 @@ namespace {
+ 			reset_filter_and_imu();
+ 		}
+ 
+-		// 7200 deg/sec
+-		constexpr double max_rad_per_sec = 20.0 * double(EIGEN_PI) * 2;
+-		if (filter_state.angularVelocity().squaredNorm() > max_rad_per_sec * max_rad_per_sec) {
++		// Post-correct guard: with the input now sanitised this should be
++		// unreachable in normal use, but a numerical blow-up inside the
++		// filter still warrants a reset rather than emitting garbage.
++		if (filter_state.angularVelocity().squaredNorm() > MAX_GYRO_RAD_PER_SEC * MAX_GYRO_RAD_PER_SEC) {
+ 			U_LOG_E(
+-			    "Got excessive angular velocity when filtering "
+-			    "IMU - resetting filter and IMU fusion!");
++			    "Filter angular velocity diverged post-correct - "
++			    "resetting filter and IMU fusion!");
+ 			reset_filter_and_imu();
+ 		}
+ 
+@@ -608,7 +705,9 @@ namespace {
+ 			// position/orientation anchor, so it is never skipped.
+ 			predict_filter_to(sample->timestamp_ns);
+ 
+-			if (integrate_pose(sample->pose, position_variance, orientation_variance, residual_limit)) {
++			PoseResult res =
++			    integrate_pose(sample->pose, position_variance, orientation_variance, residual_limit);
++			if (res == PoseResult::ACCEPTED) {
+ 				tracked = true;
+ 				position_state.valid = true;
+ 				position_state.tracked = true;
+@@ -619,12 +718,10 @@ namespace {
+ 				// lost too long to trust IMU position dead-reckoning.
+ 				last_optical_ns = sample->timestamp_ns;
+ 				last_good_position = filter_state.position();
+-			} else {
+-				U_LOG_W(
+-				    "Got non-finite something when filtering "
+-				    "tracker - resetting filter!");
+-				reset_filter();
+ 			}
++			// REJECTED: implausible candidate skipped, filter and anchor
++			// left untouched so tracking stays continuous.
++			// RESET: integrate_pose already reset the filter; nothing to do.
+ 
+ 			publish_snapshot();
+ 		}
+diff --git a/tests/tests_kalman_fusion.cpp b/tests/tests_kalman_fusion.cpp
+index f15563649..40d014111 100644
+--- a/tests/tests_kalman_fusion.cpp
++++ b/tests/tests_kalman_fusion.cpp
+@@ -533,6 +533,153 @@ TEST_CASE("kalman: smooths noisy optical poses")
+ 	CHECK(max_abs_out < noise_amp * 0.7);
+ }
+ 
++TEST_CASE("kalman: a single glitch IMU sample does not reset or blow up the filter")
++{
++	// Regression guard for the spurious full-filter reset. A consumer
++	// controller IMU occasionally emits one corrupt sample with a
++	// physically impossible angular rate (the live log's "excessive angular
++	// velocity ... resetting filter"). One such glitch must NOT destroy
++	// tracking: the filter must reject the lone outlier, keep its anchor,
++	// and a stationary controller must stay put — finite and bounded.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	const xrt_vec3 home = {0.4f, 0.9f, -0.2f};
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++
++	// Establish solid tracking at a fixed point.
++	for (int i = 0; i < 100; i++) {
++		feed_pose(kf.get(), t, home, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	xrt_space_relation before{};
++	kf->get_prediction(t, &before);
++	REQUIRE((before.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
++
++	// One catastrophic gyro glitch: ~115000 deg/s on every axis. The old
++	// code integrated this, tripped the post-correct check, and wiped the
++	// whole filter. It must now be rejected with the filter intact.
++	const xrt_vec3 glitch_gyro = {2000.0f, 2000.0f, 2000.0f};
++	feed_imu(kf.get(), t, accel_rest, glitch_gyro);
++	t += DT_NS;
++
++	// Right after the glitch: still tracked, still at home, still finite.
++	xrt_space_relation after_glitch{};
++	kf->get_prediction(t, &after_glitch);
++	REQUIRE(std::isfinite(after_glitch.pose.position.x));
++	REQUIRE(std::isfinite(after_glitch.pose.orientation.w));
++	// The lone glitch must not have forced a reset (tracked bit retained).
++	CHECK((after_glitch.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
++	CHECK(after_glitch.pose.position.x == Approx(home.x).margin(0.1));
++	CHECK(after_glitch.pose.position.y == Approx(home.y).margin(0.1));
++	CHECK(after_glitch.pose.position.z == Approx(home.z).margin(0.1));
++	// Orientation must not have been spun off identity by the glitch.
++	CHECK(quat_abs_dot(after_glitch.pose.orientation, IDENTITY_QUAT) > 0.99f);
++
++	// Continue with good data: tracking must remain rock-solid at home.
++	for (int i = 0; i < 100; i++) {
++		feed_pose(kf.get(), t, home, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++	xrt_space_relation after{};
++	kf->get_prediction(t, &after);
++	CHECK(after.pose.position.x == Approx(home.x).margin(0.05));
++	CHECK(after.pose.position.y == Approx(home.y).margin(0.05));
++	CHECK(after.pose.position.z == Approx(home.z).margin(0.05));
++}
++
++TEST_CASE("kalman: rejects a divergent optical pose that jumps implausibly far")
++{
++	// Regression guard for the "Error pose candidate ... pos 3.9 6.9 6.9"
++	// case: the constellation matcher emits a wildly wrong pose (metres from
++	// the controller's true position) that still passes its own per-LED
++	// reprojection score. With a generous residual limit (as the real WMR
++	// driver uses), the only thing standing between that pose and a visible
++	// jerk is the position-jump gate. The divergent pose must be rejected
++	// and tracking must stay continuous at the true location.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	const xrt_vec3 home = {0.2f, 1.0f, -0.4f};
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++
++	for (int i = 0; i < 100; i++) {
++		feed_pose(kf.get(), t, home, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	// A divergent optical candidate ~9 m away, fed with the *generous*
++	// residual limit (15) the real driver passes — so it is the jump gate,
++	// not the residual check, that must catch it.
++	const xrt_vec3 divergent = {3.946f, 6.881f, 6.910f};
++	feed_pose(kf.get(), t, divergent, IDENTITY_QUAT, 15.0f);
++	t += DT_NS;
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++	// Filter must have ignored the divergent pose and stayed at home.
++	CHECK(rel.pose.position.x == Approx(home.x).margin(0.1));
++	CHECK(rel.pose.position.y == Approx(home.y).margin(0.1));
++	CHECK(rel.pose.position.z == Approx(home.z).margin(0.1));
++	CHECK((rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
++
++	// Good optical resumes: tracking continues uninterrupted at home (the
++	// rejection did not reset the filter or move the anchor).
++	for (int i = 0; i < 100; i++) {
++		feed_pose(kf.get(), t, home, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++	xrt_space_relation after{};
++	kf->get_prediction(t, &after);
++	CHECK(after.pose.position.x == Approx(home.x).margin(0.05));
++	CHECK(after.pose.position.y == Approx(home.y).margin(0.05));
++	CHECK(after.pose.position.z == Approx(home.z).margin(0.05));
++}
++
++TEST_CASE("kalman: a sustained run of anomalous IMU samples still resets")
++{
++	// The lone-glitch rejection must not mask a genuine fault. A long,
++	// sustained run of impossible IMU samples (a broken/disconnected sensor,
++	// not a one-off glitch) must still trigger a reset so the filter does
++	// not silently freeze on stale state forever.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++	for (int i = 0; i < 80; i++) {
++		feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	xrt_space_relation before{};
++	kf->get_prediction(t, &before);
++	REQUIRE((before.relation_flags & XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT) != 0);
++
++	// Many consecutive impossible gyro samples — a real fault.
++	const xrt_vec3 glitch_gyro = {2000.0f, 2000.0f, 2000.0f};
++	for (int i = 0; i < 30; i++) {
++		feed_imu(kf.get(), t, accel_rest, glitch_gyro);
++		t += DT_NS;
++	}
++
++	// The sustained anomaly must have forced a reset: the filter no longer
++	// reports tracked, and output stays finite (never garbage).
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++	REQUIRE(std::isfinite(rel.pose.position.x));
++	REQUIRE(std::isfinite(rel.pose.orientation.w));
++	CHECK((rel.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
++}
++
+ // ---------------------------------------------------------------------------
+ // Numerical stability
+ // ---------------------------------------------------------------------------
+-- 
+2.53.0
+

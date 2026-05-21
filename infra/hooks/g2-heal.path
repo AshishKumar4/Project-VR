@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch for the G2 stack drift flag (set by the apt hook)
+
+[Path]
+PathExists=%h/g2-studio/var/drift
+
+[Install]
+WantedBy=default.target

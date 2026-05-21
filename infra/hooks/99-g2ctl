@@ -1,0 +1,4 @@
+// g2ctl drift hook — after any apt/dpkg operation, flag a drift check for the
+// user's g2-heal.path unit (which runs `g2ctl heal --auto`). Cheap and safe: the
+// heal is idempotent and no-ops when nothing actually drifted.
+DPkg::Post-Invoke { "runuser -u mrwhite0racle -- sh -c 'mkdir -p ~/g2-studio/var && touch ~/g2-studio/var/drift' >/dev/null 2>&1 || true"; };

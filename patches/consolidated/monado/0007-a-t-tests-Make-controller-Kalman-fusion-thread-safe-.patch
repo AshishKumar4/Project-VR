@@ -1,0 +1,705 @@
+From 5baabfea13a15f78dadead092bf167e19c87ecb4 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Tue, 19 May 2026 21:32:07 -0400
+Subject: [PATCH 07/10] a/t,tests: Make controller Kalman fusion thread-safe
+ via seqlock snapshot
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The Kalman fusion's get_prediction ran on SteamVR's ~1 kHz render thread
+with no synchronization while process_imu_data (~210 Hz) and process_pose
+(~60 Hz) mutated the 22-dim filter state from other threads. Torn reads
+of the multi-word Eigen state produced catastrophic prediction spikes
+(11 m / 171 m/s in recorded data), giving controllers a springy,
+intermittently drifting feel.
+
+Redesign uses a single-writer seqlock snapshot:
+
+- Writers (already mutually exclusive via the WMR driver's data_lock,
+  plus an internal std::mutex for generality) publish a trivially-copyable
+  POD FilterSnapshot via a textbook seqlock — odd counter / body copy /
+  even counter, release fences either side of the body.
+
+- get_prediction reads the snapshot wait-free through the seqlock retry
+  loop, then extrapolates with constant-acceleration kinematics + damping
+  on the ~200 B POD. The previous 2 KB Eigen state copy and Eigen predict
+  per-call are gone from the hot path.
+
+- The per-IMU-sample std::queue<xrt_imu_sample> ff_samples allocation +
+  copy is also eliminated; integration happens immediately under the
+  filter lock with no deferred queue.
+
+The published snapshot is alignas(64) to keep the seqlock counter and
+state body off the writer's cache lines.
+
+Tests: 20 cases / 584 assertions, all green. The new
+"concurrent readers never observe a torn filter state" case spawns 4
+reader threads against live IMU + optical writer threads for 400 ms
+and verifies every read is finite and bounded — the exact regression
+that would have caught the original race.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../tracking/t_tracker_kalman_fusion.cpp      | 375 +++++++++++++-----
+ tests/CMakeLists.txt                          |   2 +-
+ tests/tests_kalman_fusion.cpp                 |  87 ++++
+ 3 files changed, 365 insertions(+), 99 deletions(-)
+
+diff --git a/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp b/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
+index 27e31b2bd..a8428d997 100644
+--- a/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
++++ b/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
+@@ -9,16 +9,17 @@
+  * @author Beyley Cardellio <ep1cm1n10n123@gmail.com>
+  * @ingroup aux_tracking
+  */
++#include <atomic>
+ #include <filesystem>
+ #include <fstream>
+ #include <mutex>
+ #include <string>
+-#include <queue>
+ #include <iomanip>
+ 
+ #include <cassert>
++#include <cmath>
++#include <cstdint>
+ #include <cstdio>
+-#include <queue>
+ 
+ #include "xrt/xrt_tracking.h"
+ 
+@@ -109,6 +110,13 @@ namespace {
+ 			*m_pose_csv << "#timestamp [ns],p_x [m],p_y [m],p_z [m],"
+ 			               "q_w [],q_x [],q_y [],q_z []" CSV_EOL;
+ 
++			// Kalman-filtered output (the pose the fusion actually reports).
++			m_fused_csv = new std::ofstream{record_path + "/fused.csv"};
++			*m_fused_csv << std::fixed << std::setprecision(CSV_PRECISION);
++			*m_fused_csv << "#timestamp [ns],p_x [m],p_y [m],p_z [m],"
++			                "q_w [],q_x [],q_y [],q_z [],"
++			                "v_x [m s^-1],v_y [m s^-1],v_z [m s^-1]" CSV_EOL;
++
+ 			m_recording = true;
+ 		}
+ 
+@@ -128,6 +136,10 @@ namespace {
+ 				delete m_pose_csv;
+ 				m_pose_csv = nullptr;
+ 			}
++			if (m_fused_csv) {
++				delete m_fused_csv;
++				m_fused_csv = nullptr;
++			}
+ 			m_recording = false;
+ 		}
+ 
+@@ -165,6 +177,23 @@ namespace {
+ 			*m_pose_csv << o.w << "," << o.x << "," << o.y << "," << o.z << CSV_EOL;
+ 		}
+ 
++		//! Log one fused (Kalman output) sample.
++		void
++		process_fused(timepoint_ns ts, const struct xrt_space_relation *rel)
++		{
++			std::lock_guard<std::mutex> lock(m_lock);
++			if (!m_recording) {
++				return;
++			}
++			xrt_vec3 p = rel->pose.position;
++			xrt_quat o = rel->pose.orientation;
++			xrt_vec3 v = rel->linear_velocity;
++			*m_fused_csv << ts << ",";
++			*m_fused_csv << p.x << "," << p.y << "," << p.z << ",";
++			*m_fused_csv << o.w << "," << o.x << "," << o.y << "," << o.z << ",";
++			*m_fused_csv << v.x << "," << v.y << "," << v.z << CSV_EOL;
++		}
++
+ 	private:
+ 		std::mutex m_lock;
+ 		bool m_recording;
+@@ -173,6 +202,7 @@ namespace {
+ 
+ 		std::ofstream *m_imu_csv = nullptr;
+ 		std::ofstream *m_pose_csv = nullptr;
++		std::ofstream *m_fused_csv = nullptr;
+ 	};
+ 
+ 	struct TrackingInfo
+@@ -180,6 +210,30 @@ namespace {
+ 		bool valid{false};
+ 		bool tracked{false};
+ 	};
++
++	//! Immutable filter state published for wait-free reads by
++	//! get_prediction. A trivially-copyable POD so the seqlock can copy it
++	//! as a flat block; the seqlock validates each read, so a torn copy is
++	//! simply retried and discarded. Vectors are plain doubles wrapped with
++	//! Eigen::Map at the boundaries; the quaternion is stored in Eigen
++	//! coefficient order (x, y, z, w).
++	struct FilterSnapshot
++	{
++		double position[3];
++		double orientation[4];
++		double linear_velocity[3];
++		double angular_velocity[3];
++		double acceleration[3];
++		double last_good_position[3];
++		timepoint_ns filter_time_ns;
++		timepoint_ns last_optical_ns;
++		bool tracked;
++		bool position_valid;
++		bool position_tracked;
++		bool orientation_valid;
++		bool orientation_tracked;
++	};
++
+ 	class KalmanFusion : public KalmanFusionInterface
+ 	{
+ 	public:
+@@ -196,10 +250,7 @@ namespace {
+ 			// short. Use gentle damping (~0.95/s retention, ~19 s time
+ 			// constant) so genuine motion is preserved while a runaway
+ 			// velocity during a long optical dropout still bleeds off.
+-			// combined_process_model holds a *reference* to
+-			// main_process_model, so this configures both the predict
+-			// and the prediction-extrapolation paths.
+-			main_process_model.setDamping(0.95, 0.95);
++			main_process_model.setDamping(KALMAN_DAMPING, KALMAN_DAMPING);
+ 
+ 			// Process-noise autocorrelation. The stock 0.01 linear value
+ 			// makes the filter badly over-confident: its velocity
+@@ -238,18 +289,37 @@ namespace {
+ 		bool
+ 		integrate_imu_sample(xrt_imu_sample &sample, Vector3d &accel_variance, Vector3d &gyro_variance);
+ 
+-		void
+-		integrate_samples_up_to(int64_t timestamp_ns);
+-
+ 		void
+ 		add_ui(void *root, const char *device_name) override;
+ 
+ 	private:
++		//! Linear and angular velocity damping per second (see ctor).
++		static constexpr double KALMAN_DAMPING = 0.95;
++		//! Position dead-reckoning is trusted only this long after the last
++		//! optical pose; past it get_prediction freezes the position.
++		static constexpr int64_t OPTICAL_FREEZE_NS = 500 * 1000 * 1000; // 0.5 s
++
+ 		void
+ 		reset_filter();
+ 		void
+ 		reset_filter_and_imu();
+ 
++		//! Advance the filter clock to @p target_ns, predicting forward if
++		//! it is ahead of the filter. A sample stamped at/behind the clock
++		//! leaves it untouched (the measurement is applied at the current
++		//! state). Caller must hold m_filter_lock.
++		void
++		predict_filter_to(int64_t target_ns);
++
++		//! Copy the current filter state into the lock-free snapshot.
++		//! Caller must hold m_filter_lock (single writer at a time).
++		void
++		publish_snapshot();
++
++		//! Wait-free seqlock read of the published snapshot.
++		FilterSnapshot
++		read_snapshot() const;
++
+ 		State filter_state;
+ 		BiasState bias_state;
+ 		CombinedState combined_state{filter_state, bias_state};
+@@ -263,12 +333,29 @@ namespace {
+ 		TrackingInfo orientation_state;
+ 		TrackingInfo position_state;
+ 
++		//! Timestamp of the last optical pose integrated, and the fused
++		//! position at that moment. Used to freeze the reported position
++		//! once optical tracking has been lost long enough that IMU
++		//! dead-reckoning would have diverged.
++		timepoint_ns last_optical_ns{0};
++		Vector3d last_good_position{0, 0, 0};
++
+ 		// TODO: Figure out a good way to expose the pose offset
+ 		// Distance from IMU origin to slam pose position
+ 		Vector3d slam_pose_offset{0, 0, 0};
+ 
+-		std::queue<xrt_imu_sample> ff_samples;
+-		std::queue<std::pair<Vector3d, Vector3d>> ff_sample_variance;
++		//! Serialises the two writer threads (IMU ~210 Hz, optical ~60 Hz)
++		//! so they never mutate the filter concurrently. The WMR driver
++		//! already calls both under its data_lock, so this is uncontended
++		//! there; it makes the class correct for any caller. get_prediction
++		//! never takes it — that path is wait-free.
++		std::mutex m_filter_lock;
++
++		//! Seqlock-published filter state. The ~1 kHz get_prediction reader
++		//! never touches the live filter — it reads this snapshot wait-free.
++		//! alignas(64): own cache line, no false sharing with the filter.
++		alignas(64) std::atomic<uint32_t> m_snapshot_seq{0};
++		FilterSnapshot m_snapshot{};
+ 
+ 		//! Recording info
+ 		std::string m_device_name;
+@@ -295,10 +382,60 @@ namespace {
+ 		}
+ 	};
+ 
++	void
++	KalmanFusion::publish_snapshot()
++	{
++		FilterSnapshot s;
++		Eigen::Map<Vector3d>{s.position} = filter_state.position();
++		Eigen::Map<Quaterniond>{s.orientation} = filter_state.getCombinedQuaternion();
++		Eigen::Map<Vector3d>{s.linear_velocity} = filter_state.velocity();
++		Eigen::Map<Vector3d>{s.angular_velocity} = filter_state.angularVelocity();
++		Eigen::Map<Vector3d>{s.acceleration} = filter_state.acceleration();
++		Eigen::Map<Vector3d>{s.last_good_position} = last_good_position;
++		s.filter_time_ns = filter_time_ns;
++		s.last_optical_ns = last_optical_ns;
++		s.tracked = tracked;
++		s.position_valid = position_state.valid;
++		s.position_tracked = position_state.tracked;
++		s.orientation_valid = orientation_state.valid;
++		s.orientation_tracked = orientation_state.tracked;
++
++		// Seqlock write: bump the counter odd, copy the body, bump it even.
++		// A reader that sees an odd counter, or a counter that changed
++		// across its copy, retries. Only the flat ~200-byte struct copy is
++		// inside the critical section, so the reader's spin window is a
++		// few ns.
++		uint32_t seq = m_snapshot_seq.load(std::memory_order_relaxed);
++		m_snapshot_seq.store(seq + 1, std::memory_order_relaxed);
++		std::atomic_thread_fence(std::memory_order_release);
++		m_snapshot = s;
++		std::atomic_thread_fence(std::memory_order_release);
++		m_snapshot_seq.store(seq + 2, std::memory_order_relaxed);
++	}
++
++	FilterSnapshot
++	KalmanFusion::read_snapshot() const
++	{
++		FilterSnapshot s;
++		uint32_t seq1, seq2;
++		do {
++			seq1 = m_snapshot_seq.load(std::memory_order_acquire);
++			while (seq1 & 1u) { // a publish is in progress
++				seq1 = m_snapshot_seq.load(std::memory_order_acquire);
++			}
++			s = m_snapshot;
++			std::atomic_thread_fence(std::memory_order_acquire);
++			seq2 = m_snapshot_seq.load(std::memory_order_relaxed);
++		} while (seq1 != seq2);
++		return s;
++	}
++
+ 	void
+ 	KalmanFusion::clear_position_tracked_flag()
+ 	{
++		std::lock_guard<std::mutex> lock(m_filter_lock);
+ 		position_state.tracked = false;
++		publish_snapshot();
+ 	}
+ 
+ 	void
+@@ -380,28 +517,20 @@ namespace {
+ 	}
+ 
+ 	void
+-	KalmanFusion::integrate_samples_up_to(int64_t target_ns)
++	KalmanFusion::predict_filter_to(int64_t target_ns)
+ 	{
+-		while (!ff_samples.empty()) {
+-			auto sample = ff_samples.front();
+-			auto variance = ff_sample_variance.front();
+-			auto ts = sample.timestamp_ns;
+-
+-			if (filter_time_ns > 0 && ts != filter_time_ns) {
+-				double dt = time_ns_to_s(ts - filter_time_ns);
+-				assert(dt > 0);
+-				flexkalman::predict(combined_state, combined_process_model, dt);
+-			}
+-
+-			filter_time_ns = ts;
+-
+-			if (ts > target_ns)
+-				break;
+-
+-			integrate_imu_sample(sample, variance.first, variance.second);
+-			ff_sample_variance.pop();
+-			ff_samples.pop();
++		if (filter_time_ns == 0) {
++			// First sample: set the clock, nothing to predict from.
++			filter_time_ns = target_ns;
++			return;
+ 		}
++		if (target_ns > filter_time_ns) {
++			double dt = time_ns_to_s(target_ns - filter_time_ns);
++			flexkalman::predict(combined_state, combined_process_model, dt);
++			filter_time_ns = target_ns;
++		}
++		// target_ns <= filter clock: the filter already covers this
++		// sample's time; the measurement is applied at the current state.
+ 	}
+ 
+ 	void
+@@ -424,24 +553,19 @@ namespace {
+ 			gyro_variance = map_vec3(*gyro_variance_optional).cast<double>();
+ 		}
+ 
+-		if (tracked) {
+-			// TODO: Prevent the queue from getting too big.
+-			// assert(ff_samples.size() <= 1024);
+-			if (ff_samples.size() >= 1024) {
+-				ff_samples.pop();
+-				ff_sample_variance.pop();
++		{
++			std::lock_guard<std::mutex> lock(m_filter_lock);
++
++			// Only dead-reckon once an optical pose has anchored the
++			// filter. Integrating each IMU sample immediately advances the
++			// filter clock continuously — that is what lets the filter
++			// gyro + accelerometer dead-reckon through optical dropouts.
++			if (tracked) {
++				xrt_imu_sample s = *sample;
++				predict_filter_to(s.timestamp_ns);
++				integrate_imu_sample(s, accel_variance, gyro_variance);
++				publish_snapshot();
+ 			}
+-
+-			ff_samples.push(*sample);
+-			ff_sample_variance.push({accel_variance, gyro_variance});
+-
+-			// Integrate the IMU sample into the filter as soon as it
+-			// arrives, so the filter time advances continuously. This is
+-			// what lets the filter dead-reckon (gyro + accelerometer)
+-			// through optical-tracking dropouts instead of freezing at
+-			// the last optical pose. The queue is drained immediately
+-			// here, so it normally holds at most a single sample.
+-			integrate_samples_up_to(sample->timestamp_ns);
+ 		}
+ 
+ 		if (m_recorder) {
+@@ -464,39 +588,45 @@ namespace {
+ 			orientation_variance = map_vec3(*orientation_variance_optional).cast<double>();
+ 		}
+ 
+-		// With continuous IMU integration (see process_imu_data) the filter
+-		// time tracks the most recent IMU sample, so an optical pose —
+-		// timestamped when its camera frame was captured — normally arrives
+-		// slightly "in the past" relative to filter_time_ns. We still apply
+-		// it: the optical pose is the filter's only absolute position/
+-		// orientation anchor. The optical latency introduces at most a
+-		// (velocity * latency) offset, which the measurement variances and
+-		// the residual limit absorb. Skipping the pose (the old behaviour)
+-		// would discard that anchor and let the filter drift on IMU alone.
+-		if (sample->timestamp_ns < filter_time_ns) {
+-			printf("Optical pose %lld ns behind filter_time (latency); applying. "
+-			       "filter_time=%zu, ts=%zu.\n",
+-			       (long long)(filter_time_ns - sample->timestamp_ns), filter_time_ns,
+-			       sample->timestamp_ns);
+-		} else {
+-			printf("Optical pose ahead of filter_time; integrating IMU forward. "
+-			       "filter_time=%zu, ts=%zu.\n",
+-			       filter_time_ns, sample->timestamp_ns);
+-		}
++		{
++			std::lock_guard<std::mutex> lock(m_filter_lock);
++
++			// Debug (kept until on-headset validation): how the optical
++			// pose timestamp relates to the filter clock. With continuous
++			// IMU integration an optical pose — stamped at camera-capture
++			// time — normally arrives slightly behind the clock.
++			if (filter_time_ns != 0) {
++				printf("kalman: optical pose %+lld ns vs filter clock; applying.\n",
++				       (long long)(sample->timestamp_ns - filter_time_ns));
++			}
+ 
+-		integrate_samples_up_to(sample->timestamp_ns);
++			// predict_filter_to only advances the filter forward; a
++			// lagging pose is applied as a correction at the current
++			// state. Its latency introduces at most a (velocity * latency)
++			// offset, absorbed by the measurement variance and residual
++			// limit. The optical pose is the filter's only absolute
++			// position/orientation anchor, so it is never skipped.
++			predict_filter_to(sample->timestamp_ns);
++
++			if (integrate_pose(sample->pose, position_variance, orientation_variance, residual_limit)) {
++				tracked = true;
++				position_state.valid = true;
++				position_state.tracked = true;
++				orientation_state.valid = true;
++				orientation_state.tracked = true;
++				// Remember the last optically-anchored position;
++				// get_prediction freezes to it once optical has been
++				// lost too long to trust IMU position dead-reckoning.
++				last_optical_ns = sample->timestamp_ns;
++				last_good_position = filter_state.position();
++			} else {
++				U_LOG_W(
++				    "Got non-finite something when filtering "
++				    "tracker - resetting filter!");
++				reset_filter();
++			}
+ 
+-		if (integrate_pose(sample->pose, position_variance, orientation_variance, residual_limit)) {
+-			tracked = true;
+-			position_state.valid = true;
+-			position_state.tracked = true;
+-			orientation_state.valid = true;
+-			orientation_state.tracked = true;
+-		} else {
+-			U_LOG_W(
+-			    "Got non-finite something when filtering "
+-			    "tracker - resetting filter!");
+-			reset_filter();
++			publish_snapshot();
+ 		}
+ 
+ 		if (m_recorder) {
+@@ -504,7 +634,6 @@ namespace {
+ 		}
+ 	}
+ 
+-
+ 	void
+ 	KalmanFusion::get_prediction(timepoint_ns when_ns, struct xrt_space_relation *out_relation)
+ 	{
+@@ -514,36 +643,82 @@ namespace {
+ 		// Clear to identity values
+ 		U_ZERO(out_relation);
+ 		out_relation->pose.orientation.w = 1;
+-		if (!tracked || filter_time_ns == 0) {
++
++		// Wait-free seqlock read — never touches the live filter.
++		const FilterSnapshot snap = read_snapshot();
++		if (!snap.tracked || snap.filter_time_ns == 0) {
+ 			return;
+ 		}
+-
+-		// integrate_samples_up_to(when_ns);
+-
+-		float dt = time_ns_to_s(when_ns - filter_time_ns);
+-		auto predicted_state = flexkalman::getPrediction(filter_state, main_process_model, dt);
+-
+-		map_vec3(out_relation->pose.position) = predicted_state.position().cast<float>();
+-		map_quat(out_relation->pose.orientation) = predicted_state.getQuaternion().cast<float>();
+-		map_vec3(out_relation->linear_velocity) = predicted_state.velocity().cast<float>();
+-		map_vec3(out_relation->angular_velocity) = predicted_state.angularVelocity().cast<float>();
++		const Eigen::Map<const Vector3d> s_pos{snap.position};
++		const Eigen::Map<const Vector3d> s_lvel{snap.linear_velocity};
++		const Eigen::Map<const Vector3d> s_avel{snap.angular_velocity};
++		const Eigen::Map<const Vector3d> s_acc{snap.acceleration};
++		const Eigen::Map<const Vector3d> s_lgp{snap.last_good_position};
++		const Eigen::Map<const Quaterniond> s_orient{snap.orientation};
++
++		// Extrapolate the snapshot forward to when_ns. This mirrors
++		// flexkalman predictStateOnly (constant-acceleration kinematics +
++		// separate velocity damping) but runs on the small POD snapshot —
++		// no 2 KB Eigen state copy, no filter access.
++		const double dt = time_ns_to_s(when_ns - snap.filter_time_ns);
++		const double atten = std::pow(KALMAN_DAMPING, dt);
++
++		const Vector3d vel = s_lvel + s_acc * dt;
++		const Vector3d pos = s_pos + vel * dt;
++		const Vector3d vel_damped = vel * atten;
++		const Vector3d angvel_damped = s_avel * atten;
++
++		// Orientation advances by the world-frame rotation vector omega*dt
++		// (left-multiplied, matching the filter's externalized quaternion).
++		const Vector3d rotvec = s_avel * dt;
++		const double angle = rotvec.norm();
++		Quaterniond orient = s_orient;
++		if (angle > 1e-9) {
++			orient = Quaterniond{AngleAxisd{angle, rotvec / angle}} * s_orient;
++		}
++		orient.normalize();
++
++		// A controller IMU cannot dead-reckon position for more than a
++		// fraction of a second without diverging (metres of drift). Once
++		// optical has been absent past OPTICAL_FREEZE_NS, freeze the
++		// reported position at the last optically-anchored estimate and
++		// stop flagging it tracked. Gyro-driven orientation is good for far
++		// longer, so it keeps updating.
++		const bool optical_stale =
++		    snap.last_optical_ns == 0 || (when_ns - snap.last_optical_ns) > OPTICAL_FREEZE_NS;
++
++		map_quat(out_relation->pose.orientation) = orient.cast<float>();
++		map_vec3(out_relation->angular_velocity) = angvel_damped.cast<float>();
++		if (optical_stale) {
++			map_vec3(out_relation->pose.position) = s_lgp.cast<float>();
++			out_relation->linear_velocity = xrt_vec3{0.f, 0.f, 0.f};
++		} else {
++			map_vec3(out_relation->pose.position) = pos.cast<float>();
++			map_vec3(out_relation->linear_velocity) = vel_damped.cast<float>();
++		}
+ 
+ 		uint64_t flags = 0;
+-		if (position_state.valid) {
++		if (snap.position_valid) {
+ 			flags |= XRT_SPACE_RELATION_POSITION_VALID_BIT;
+-			flags |= XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT;
+-			if (position_state.tracked) {
+-				flags |= XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
++			if (!optical_stale) {
++				flags |= XRT_SPACE_RELATION_LINEAR_VELOCITY_VALID_BIT;
++				if (snap.position_tracked) {
++					flags |= XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
++				}
+ 			}
+ 		}
+-		if (orientation_state.valid) {
++		if (snap.orientation_valid) {
+ 			flags |= XRT_SPACE_RELATION_ORIENTATION_VALID_BIT;
+ 			flags |= XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT;
+-			if (orientation_state.tracked) {
++			if (snap.orientation_tracked) {
+ 				flags |= XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT;
+ 			}
+ 		}
+ 		out_relation->relation_flags = (xrt_space_relation_flags)flags;
++
++		if (m_recorder) {
++			m_recorder->process_fused(when_ns, out_relation);
++		}
+ 	}
+ 
+ 	void
+@@ -552,10 +727,14 @@ namespace {
+ 		const char *record_path = debug_get_option_kalman_record_path();
+ 		if (record_path != NULL) {
+ 			m_recorder = new ImuPoseRecorder(record_path, device_name);
++			// Auto-start: capture the whole session. The SteamVR-embedded
++			// path has no debug UI to press the button.
++			m_recorder->start();
++			m_recording = true;
+ 
+ 			m_recording_btn.cb = KalmanFusion::recorder_btn_cb;
+ 			m_recording_btn.ptr = this;
+-			u_var_add_button(root, &m_recording_btn, "Record dataset");
++			u_var_add_button(root, &m_recording_btn, "Stop recording");
+ 		}
+ 	}
+ 
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index a13cb1a8d..93a7efc19 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -75,7 +75,7 @@ target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
+ target_link_libraries(tests_vec3_angle PRIVATE aux_math)
+ 
+ if(XRT_HAVE_OPENCV)
+-	target_link_libraries(tests_kalman_fusion PRIVATE aux_math aux_tracking)
++	target_link_libraries(tests_kalman_fusion PRIVATE aux_math aux_tracking Threads::Threads)
+ endif()
+ 
+ if(XRT_BUILD_DRIVER_HANDTRACKING)
+diff --git a/tests/tests_kalman_fusion.cpp b/tests/tests_kalman_fusion.cpp
+index e4b3be16e..f15563649 100644
+--- a/tests/tests_kalman_fusion.cpp
++++ b/tests/tests_kalman_fusion.cpp
+@@ -30,8 +30,11 @@
+ #include "xrt/xrt_tracking.h"
+ #include "math/m_api.h"
+ 
++#include <atomic>
++#include <chrono>
+ #include <cmath>
+ #include <memory>
++#include <thread>
+ #include <vector>
+ 
+ using xrt::auxiliary::tracking::KalmanFusionInterface;
+@@ -748,3 +751,87 @@ TEST_CASE("kalman: an extended optical dropout stays finite and bounded")
+ 	CHECK(std::abs(rel.pose.position.y) < 1.0);
+ 	CHECK(std::abs(rel.pose.position.z) < 1.0);
+ }
++
++// ---------------------------------------------------------------------------
++// Concurrency
++// ---------------------------------------------------------------------------
++
++TEST_CASE("kalman: concurrent readers never observe a torn filter state")
++{
++	// Regression guard for the data race that made controllers unusable:
++	// get_prediction runs on the render thread with no lock while the IMU
++	// and optical threads mutate the multi-word filter state. A torn read
++	// produced catastrophic position spikes (metres, in a fraction of a
++	// second). With the seqlock snapshot every concurrent read must be
++	// finite and — for a device truly stationary at the origin — bounded.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	// Anchor the filter at the origin, at rest, single-threaded.
++	int64_t t = 1000000;
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++	for (int i = 0; i < 50; i++) {
++		feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	std::atomic<bool> run{true};
++	std::atomic<int64_t> clock_ns{t};
++	std::atomic<int64_t> reads{0};
++	std::atomic<int> non_finite{0};
++	std::atomic<int> torn{0}; // finite but physically impossible
++
++	// IMU writer: stationary samples, advancing the shared clock.
++	std::thread imu_thread([&] {
++		while (run.load(std::memory_order_relaxed)) {
++			int64_t ts = clock_ns.fetch_add(DT_NS, std::memory_order_relaxed) + DT_NS;
++			feed_imu(kf.get(), ts, accel_rest, ZERO_VEC);
++		}
++	});
++	// Optical writer: stationary poses at the origin.
++	std::thread pose_thread([&] {
++		while (run.load(std::memory_order_relaxed)) {
++			int64_t ts = clock_ns.load(std::memory_order_relaxed);
++			feed_pose(kf.get(), ts, ZERO_VEC, IDENTITY_QUAT);
++			std::this_thread::sleep_for(std::chrono::microseconds(200));
++		}
++	});
++	// Reader threads: hammer get_prediction, as the render thread does.
++	// Catch2 macros are not thread-safe, so failures are tallied atomically
++	// and asserted on the main thread after the join.
++	std::vector<std::thread> readers;
++	for (int r = 0; r < 4; r++) {
++		readers.emplace_back([&] {
++			while (run.load(std::memory_order_relaxed)) {
++				xrt_space_relation rel{};
++				kf->get_prediction(clock_ns.load(std::memory_order_relaxed), &rel);
++				reads.fetch_add(1, std::memory_order_relaxed);
++
++				const xrt_vec3 &p = rel.pose.position;
++				const xrt_quat &q = rel.pose.orientation;
++				if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
++				    !std::isfinite(q.x) || !std::isfinite(q.y) || !std::isfinite(q.z) ||
++				    !std::isfinite(q.w)) {
++					non_finite.fetch_add(1, std::memory_order_relaxed);
++				} else if (std::abs(p.x) > 5.0f || std::abs(p.y) > 5.0f ||
++				           std::abs(p.z) > 5.0f) {
++					torn.fetch_add(1, std::memory_order_relaxed);
++				}
++			}
++		});
++	}
++
++	std::this_thread::sleep_for(std::chrono::milliseconds(400));
++	run.store(false, std::memory_order_relaxed);
++	imu_thread.join();
++	pose_thread.join();
++	for (auto &th : readers) {
++		th.join();
++	}
++
++	INFO("concurrent get_prediction calls: " << reads.load());
++	CHECK(reads.load() > 1000);     // the readers genuinely ran against live writers
++	CHECK(non_finite.load() == 0);  // never a NaN/Inf from a torn read
++	CHECK(torn.load() == 0);        // never a spike: stationary device stayed put
++}
+-- 
+2.53.0
+

@@ -1,0 +1,809 @@
+From cfb6816be3c085d295cd0d07b19835067e453bae Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Fri, 15 May 2026 22:58:54 -0400
+Subject: [PATCH 05/10] tests: Add rigorous Kalman controller-fusion test suite
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+19 first-principles test cases (580 assertions) for
+t_tracker_kalman_fusion. Synthetic IMU and optical-pose data is
+generated from true rigid-body physics — never from the filter's own
+measurement model — and the filter is required to recover ground
+truth. Covers lifecycle, orientation (stationary/tilted/rotating/
+gyro integration), position and velocity tracking, accelerometer
+dead-reckoning including a tilted body frame, robustness (residual
+rejection, reset recovery, optical-noise smoothing, dropout
+re-convergence, optical latency) and numerical stability.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ tests/CMakeLists.txt          |   7 +
+ tests/tests_kalman_fusion.cpp | 750 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 757 insertions(+)
+ create mode 100644 tests/tests_kalman_fusion.cpp
+
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 0d0789d5e..a13cb1a8d 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -24,6 +24,9 @@ set(tests
+     tests_pose
+     tests_vec3_angle
+ 	)
++if(XRT_HAVE_OPENCV)
++	list(APPEND tests tests_kalman_fusion)
++endif()
+ if(XRT_HAVE_D3D11)
+ 	list(APPEND tests tests_aux_d3d_d3d11 tests_comp_client_d3d11)
+ endif()
+@@ -71,6 +74,10 @@ target_link_libraries(tests_quat_change_of_basis PRIVATE aux_math)
+ target_link_libraries(tests_quat_swing_twist PRIVATE aux_math)
+ target_link_libraries(tests_vec3_angle PRIVATE aux_math)
+ 
++if(XRT_HAVE_OPENCV)
++	target_link_libraries(tests_kalman_fusion PRIVATE aux_math aux_tracking)
++endif()
++
+ if(XRT_BUILD_DRIVER_HANDTRACKING)
+ 	target_link_libraries(
+ 		tests_levenbergmarquardt
+diff --git a/tests/tests_kalman_fusion.cpp b/tests/tests_kalman_fusion.cpp
+new file mode 100644
+index 000000000..e4b3be16e
+--- /dev/null
++++ b/tests/tests_kalman_fusion.cpp
+@@ -0,0 +1,750 @@
++// Copyright 2026, NVIDIA CORPORATION.
++// SPDX-License-Identifier: BSL-1.0
++/*!
++ * @file
++ * @brief Rigorous, first-principles test suite for the controller Kalman
++ *        fusion (t_tracker_kalman_fusion).
++ *
++ * Every test synthesises IMU and optical-pose data from the *true* physics of
++ * a moving rigid body and asserts that the filter recovers ground truth. The
++ * synthetic data is generated from first principles — never from the filter's
++ * own measurement model — so a wrong model fails a test rather than silently
++ * agreeing with itself.
++ *
++ * Conventions under test:
++ *  - Frames: world is Y-up; g_world = (0, -9.80665, 0). A state/optical
++ *    quaternion q is body->world.
++ *  - Accelerometer: measures specific force in the body frame,
++ *      a_meas_body = R_world->body * (a_world - g_world) + accelBias
++ *    i.e. q.conjugate() * (a_world - g_world) at zero bias.
++ *  - Gyro: process_imu_data() receives the raw body-frame angular rate.
++ *
++ * @ingroup aux_tracking
++ */
++
++#include "catch_amalgamated.hpp"
++
++#include "tracking/t_tracker_kalman_fusion.hpp"
++
++#include "xrt/xrt_defines.h"
++#include "xrt/xrt_tracking.h"
++#include "math/m_api.h"
++
++#include <cmath>
++#include <memory>
++#include <vector>
++
++using xrt::auxiliary::tracking::KalmanFusionInterface;
++using Catch::Approx;
++
++namespace {
++
++constexpr double GRAVITY = 9.80665;
++//! Gravitational acceleration in the world frame (Y-up).
++const xrt_vec3 G_WORLD = {0.0f, -(float)GRAVITY, 0.0f};
++const xrt_quat IDENTITY_QUAT = {0.0f, 0.0f, 0.0f, 1.0f};
++const xrt_vec3 ZERO_VEC = {0.0f, 0.0f, 0.0f};
++
++//! 500 Hz IMU / pose cadence.
++constexpr int64_t DT_NS = 2000000;
++constexpr double DT_S = 0.002;
++
++//! Rotate a vector by quaternion q (q is body->world).
++xrt_vec3
++rotate(const xrt_quat &q, const xrt_vec3 &v)
++{
++	xrt_vec3 out{};
++	math_quat_rotate_vec3(&q, &v, &out);
++	return out;
++}
++
++xrt_quat
++inverse(const xrt_quat &q)
++{
++	xrt_quat out{};
++	math_quat_invert(&q, &out);
++	return out;
++}
++
++xrt_quat
++quat_axis_angle(const xrt_vec3 &axis, float angle_rad)
++{
++	xrt_quat out{};
++	math_quat_from_angle_vector(angle_rad, &axis, &out);
++	return out;
++}
++
++//! Absolute dot product of two unit quaternions (1.0 == identical rotation).
++float
++quat_abs_dot(const xrt_quat &a, const xrt_quat &b)
++{
++	return std::abs(a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z);
++}
++
++xrt_vec3_f64
++to_f64(const xrt_vec3 &v)
++{
++	return xrt_vec3_f64{v.x, v.y, v.z};
++}
++
++/*!
++ * Body-frame accelerometer reading for a device with orientation @p q_b2w
++ * experiencing world-frame linear acceleration @p a_world. First principles:
++ * a_meas = R_world->body * (a_world - g_world).
++ */
++xrt_vec3
++make_accel_body(const xrt_quat &q_b2w, const xrt_vec3 &a_world)
++{
++	xrt_vec3 specific = {a_world.x - G_WORLD.x, a_world.y - G_WORLD.y, a_world.z - G_WORLD.z};
++	return rotate(inverse(q_b2w), specific);
++}
++
++void
++feed_imu(KalmanFusionInterface *kf, int64_t ts, const xrt_vec3 &accel_body, const xrt_vec3 &gyro_body)
++{
++	xrt_imu_sample s{};
++	s.timestamp_ns = ts;
++	s.accel_m_s2 = to_f64(accel_body);
++	s.gyro_rad_secs = to_f64(gyro_body);
++	kf->process_imu_data(&s, nullptr, nullptr);
++}
++
++void
++feed_pose(KalmanFusionInterface *kf,
++          int64_t ts,
++          const xrt_vec3 &pos,
++          const xrt_quat &orient,
++          float residual_limit = 15.0f)
++{
++	xrt_pose_sample s{};
++	s.timestamp_ns = ts;
++	s.pose.position = pos;
++	s.pose.orientation = orient;
++	kf->process_pose(&s, nullptr, nullptr, residual_limit);
++}
++
++//! Feed a pose + a matching IMU sample for a device at orientation @p q,
++//! world position @p pos, world linear acceleration @p a_world, body gyro
++//! @p gyro. Returns the body-frame accelerometer reading used.
++void
++feed_pose_and_imu(KalmanFusionInterface *kf,
++                  int64_t ts,
++                  const xrt_vec3 &pos,
++                  const xrt_quat &q,
++                  const xrt_vec3 &a_world,
++                  const xrt_vec3 &gyro)
++{
++	feed_pose(kf, ts, pos, q);
++	feed_imu(kf, ts, make_accel_body(q, a_world), gyro);
++}
++
++} // namespace
++
++// ---------------------------------------------------------------------------
++// Lifecycle / safety
++// ---------------------------------------------------------------------------
++
++TEST_CASE("kalman: prediction before any data is a safe identity")
++{
++	// A fresh filter that has never seen a sample must return a clean
++	// identity relation with nothing flagged valid — never garbage.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	xrt_space_relation rel{};
++	kf->get_prediction(1000000, &rel);
++
++	CHECK(rel.pose.position.x == Approx(0.0).margin(1e-6));
++	CHECK(rel.pose.position.y == Approx(0.0).margin(1e-6));
++	CHECK(rel.pose.position.z == Approx(0.0).margin(1e-6));
++	CHECK(rel.pose.orientation.w == Approx(1.0).margin(1e-6));
++	CHECK(rel.relation_flags == 0); // nothing valid yet
++}
++
++// ---------------------------------------------------------------------------
++// Orientation
++// ---------------------------------------------------------------------------
++
++TEST_CASE("kalman: stationary device stays put")
++{
++	// At rest: identity orientation, accelerometer reads the pure upward
++	// gravity reaction (0, +g, 0), gyro zero. After an optical anchor and
++	// 2 s of rest IMU (pure dead-reckoning), there must be no drift.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	const xrt_vec3 start_pos = {1.0f, 1.5f, -0.5f};
++	int64_t t = 1000000;
++
++	for (int i = 0; i < 10; i++) {
++		feed_pose(kf.get(), t, start_pos, IDENTITY_QUAT);
++		t += DT_NS;
++	}
++
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++	CHECK(accel_rest.x == Approx(0.0).margin(1e-5));
++	CHECK(accel_rest.y == Approx(GRAVITY).margin(1e-5));
++	CHECK(accel_rest.z == Approx(0.0).margin(1e-5));
++
++	for (int i = 0; i < 1000; i++) {
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++
++	CHECK(rel.pose.position.x == Approx(start_pos.x).margin(0.05));
++	CHECK(rel.pose.position.y == Approx(start_pos.y).margin(0.05));
++	CHECK(rel.pose.position.z == Approx(start_pos.z).margin(0.05));
++	CHECK(std::abs(rel.pose.orientation.w) > 0.999);
++}
++
++TEST_CASE("kalman: stationary tilted device does not drift on gravity")
++{
++	// A device tilted 30 deg and held at rest. The accelerometer reads the
++	// gravity reaction *in the tilted body frame* — a non-trivial vector.
++	// The filter must NOT mistake that for linear acceleration and dead-
++	// reckon away: gravity must be correctly cancelled in the body frame.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	const xrt_quat tilt = quat_axis_angle({1.0f, 0.0f, 0.0f}, 0.5236f); // 30 deg
++	int64_t t = 1000000;
++
++	for (int i = 0; i < 20; i++) {
++		feed_pose_and_imu(kf.get(), t, ZERO_VEC, tilt, ZERO_VEC, ZERO_VEC);
++		t += DT_NS;
++	}
++	const xrt_vec3 accel_tilt_rest = make_accel_body(tilt, ZERO_VEC);
++	for (int i = 0; i < 1000; i++) {
++		feed_imu(kf.get(), t, accel_tilt_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++
++	// 2 s tilted at rest: position must stay within a few cm of the origin.
++	CHECK(std::abs(rel.pose.position.x) < 0.08);
++	CHECK(std::abs(rel.pose.position.y) < 0.08);
++	CHECK(std::abs(rel.pose.position.z) < 0.08);
++}
++
++TEST_CASE("kalman: tracks a tilted orientation with a consistent accelerometer")
++{
++	// Device held at rest, tilted 20 deg about world X. Optical reports the
++	// true tilt; the accelerometer reading is the consistent gravity
++	// reaction. The filter must converge orientation to the tilt.
++	//
++	// Observability note: this filter carries a free linear-acceleration
++	// state, so a steady accelerometer reading alone does NOT determine
++	// orientation. Orientation is observed from the optical pose; the
++	// accelerometer provides the gravity reference and linear acceleration.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	const xrt_quat tilt = quat_axis_angle({1.0f, 0.0f, 0.0f}, 0.349066f); // 20 deg
++	int64_t t = 1000000;
++
++	for (int i = 0; i < 200; i++) {
++		feed_pose_and_imu(kf.get(), t, ZERO_VEC, tilt, ZERO_VEC, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++
++	CHECK(quat_abs_dot(rel.pose.orientation, tilt) > 0.99f); // converged to tilt
++	CHECK(std::abs(rel.pose.orientation.w) < 0.999f);        // off identity
++}
++
++TEST_CASE("kalman: tracks a rotating optical orientation")
++{
++	// Optical poses describe a steady yaw rotation; matching body gyro is
++	// supplied. The filter orientation must follow the commanded rotation.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	const double yaw_rate = 0.6; // rad/s about world/body Y (upright yaw)
++	const xrt_vec3 gyro_body = {0.0f, (float)yaw_rate, 0.0f};
++	int64_t t = 1000000;
++	double yaw = 0.0;
++
++	for (int i = 0; i < 500; i++) { // 1 s
++		xrt_quat q = quat_axis_angle({0.0f, 1.0f, 0.0f}, (float)yaw);
++		// Upright yaw keeps gravity along body Y, so accel stays (0,+g,0).
++		feed_pose_and_imu(kf.get(), t, ZERO_VEC, q, ZERO_VEC, gyro_body);
++		yaw += yaw_rate * DT_S;
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++
++	xrt_quat expected = quat_axis_angle({0.0f, 1.0f, 0.0f}, (float)yaw);
++	CHECK(quat_abs_dot(rel.pose.orientation, expected) > 0.99f);
++}
++
++TEST_CASE("kalman: gyro integration advances orientation during optical dropout")
++{
++	// Establish identity orientation, then drop optical and feed only a
++	// steady body gyro. The filter must integrate the gyro and rotate the
++	// orientation by approximately omega * t.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	for (int i = 0; i < 50; i++) {
++		feed_pose_and_imu(kf.get(), t, ZERO_VEC, IDENTITY_QUAT, ZERO_VEC, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	const double yaw_rate = 0.5; // rad/s
++	const xrt_vec3 gyro_body = {0.0f, (float)yaw_rate, 0.0f};
++	const xrt_vec3 accel_upright = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++	int steps = 500; // 1 s, optical dropped
++	for (int i = 0; i < steps; i++) {
++		feed_imu(kf.get(), t, accel_upright, gyro_body);
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++
++	double expected_yaw = yaw_rate * steps * DT_S; // 0.5 rad
++	xrt_quat expected = quat_axis_angle({0.0f, 1.0f, 0.0f}, (float)expected_yaw);
++	// Allow for filter ramp-up; the rotation must be substantial and in
++	// the right ballpark of the commanded integral.
++	CHECK(quat_abs_dot(rel.pose.orientation, expected) > 0.95f);
++	CHECK(quat_abs_dot(rel.pose.orientation, IDENTITY_QUAT) < 0.99f);
++}
++
++// ---------------------------------------------------------------------------
++// Position / velocity
++// ---------------------------------------------------------------------------
++
++TEST_CASE("kalman: tracks constant-velocity motion and estimates velocity")
++{
++	// Optical poses describe motion at a constant 1 m/s along +X. The
++	// filter must track position and report a linear velocity near 1 m/s.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	const double vx = 1.0;
++	int64_t t = 1000000;
++	double x = 0.0;
++
++	for (int i = 0; i < 400; i++) {
++		xrt_vec3 pos = {(float)x, 0.0f, 0.0f};
++		// Constant velocity => zero linear acceleration.
++		feed_pose_and_imu(kf.get(), t, pos, IDENTITY_QUAT, ZERO_VEC, ZERO_VEC);
++		x += vx * DT_S;
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++
++	CHECK(rel.pose.position.x == Approx(x).margin(0.05));
++	CHECK(rel.linear_velocity.x == Approx(vx).margin(0.25));
++	CHECK(std::abs(rel.linear_velocity.y) < 0.25);
++	CHECK(std::abs(rel.linear_velocity.z) < 0.25);
++}
++
++TEST_CASE("kalman: dead-reckons constant acceleration through optical dropout")
++{
++	// Anchor at rest, then apply a known constant world acceleration with
++	// optical dropped. The filter must dead-reckon position from the
++	// accelerometer toward p = 1/2 a t^2.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++	for (int i = 0; i < 50; i++) {
++		feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	const xrt_vec3 a_world = {2.0f, 0.0f, 0.0f};
++	const xrt_vec3 accel_moving = make_accel_body(IDENTITY_QUAT, a_world);
++	int steps = 150; // 0.3 s
++	for (int i = 0; i < steps; i++) {
++		feed_imu(kf.get(), t, accel_moving, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	double T = steps * DT_S;
++	double expected_x = 0.5 * 2.0 * T * T;
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++
++	CHECK(rel.pose.position.x > expected_x * 0.5);
++	CHECK(rel.pose.position.x < expected_x * 1.5);
++	CHECK(std::abs(rel.pose.position.y) < 0.1);
++	CHECK(std::abs(rel.pose.position.z) < 0.1);
++}
++
++TEST_CASE("kalman: dead-reckons body-frame acceleration while tilted")
++{
++	// The device is tilted 30 deg about world X. It then undergoes a known
++	// world-frame +X acceleration with optical dropped. The accelerometer
++	// reading is the rotated body-frame specific force; the filter must
++	// transform it back and move the WORLD position along +X — not along a
++	// tilted body axis. This fails if the body<->world rotation is wrong.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	const xrt_quat tilt = quat_axis_angle({1.0f, 0.0f, 0.0f}, 0.5236f); // 30 deg
++	int64_t t = 1000000;
++
++	for (int i = 0; i < 80; i++) {
++		feed_pose_and_imu(kf.get(), t, ZERO_VEC, tilt, ZERO_VEC, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	const xrt_vec3 a_world = {3.0f, 0.0f, 0.0f};
++	const xrt_vec3 accel_moving = make_accel_body(tilt, a_world);
++	int steps = 150; // 0.3 s
++	for (int i = 0; i < steps; i++) {
++		feed_imu(kf.get(), t, accel_moving, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	double T = steps * DT_S;
++	double expected_x = 0.5 * 3.0 * T * T;
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++
++	// Motion must be predominantly along world +X, not leaked into Y/Z.
++	CHECK(rel.pose.position.x > expected_x * 0.5);
++	CHECK(rel.pose.position.x < expected_x * 1.5);
++	CHECK(std::abs(rel.pose.position.y) < expected_x * 0.35);
++	CHECK(std::abs(rel.pose.position.z) < expected_x * 0.35);
++}
++
++// ---------------------------------------------------------------------------
++// Robustness
++// ---------------------------------------------------------------------------
++
++TEST_CASE("kalman: rejects a wildly inconsistent optical pose")
++{
++	// Stable tracking near the origin, then a single optical pose 100 m
++	// away with a 1 m residual limit. The bogus pose must be rejected.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++	for (int i = 0; i < 50; i++) {
++		feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	feed_pose(kf.get(), t, {100.0f, 100.0f, 100.0f}, IDENTITY_QUAT, 1.0f);
++	t += DT_NS;
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++
++	CHECK(std::abs(rel.pose.position.x) < 10.0);
++	CHECK(std::abs(rel.pose.position.y) < 10.0);
++	CHECK(std::abs(rel.pose.position.z) < 10.0);
++}
++
++TEST_CASE("kalman: recovers tracking after a bad pose forces a reset")
++{
++	// Establish tracking, inject one bogus pose (forces an internal reset),
++	// then resume feeding good optical poses at a known location. The
++	// filter must re-converge to the correct position.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	const xrt_vec3 home = {0.7f, 1.0f, -0.3f};
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++
++	for (int i = 0; i < 60; i++) {
++		feed_pose(kf.get(), t, home, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	// Bogus pose: forces reset_filter() inside the fusion.
++	feed_pose(kf.get(), t, {500.0f, 0.0f, 0.0f}, IDENTITY_QUAT, 1.0f);
++	t += DT_NS;
++
++	// Resume good data.
++	for (int i = 0; i < 200; i++) {
++		feed_pose(kf.get(), t, home, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++
++	CHECK(rel.pose.position.x == Approx(home.x).margin(0.1));
++	CHECK(rel.pose.position.y == Approx(home.y).margin(0.1));
++	CHECK(rel.pose.position.z == Approx(home.z).margin(0.1));
++}
++
++TEST_CASE("kalman: smooths noisy optical poses")
++{
++	// The true device is at rest at the origin. Optical poses are corrupted
++	// with a deterministic high-frequency jitter of +/-3 cm per axis. A
++	// working filter must output a position substantially smoother than the
++	// raw measurement noise.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	const float noise_amp = 0.03f; // 3 cm
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++	int64_t t = 1000000;
++
++	double max_abs_out = 0.0;
++	for (int i = 0; i < 600; i++) {
++		// Alternating-sign jitter is the highest-frequency noise the
++		// filter can be asked to reject.
++		float s = (i % 2 == 0) ? noise_amp : -noise_amp;
++		feed_pose(kf.get(), t, {s, s, s}, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++
++		if (i > 200) { // after convergence
++			xrt_space_relation rel{};
++			kf->get_prediction(t, &rel);
++			max_abs_out = std::max({max_abs_out, (double)std::abs(rel.pose.position.x),
++			                        (double)std::abs(rel.pose.position.y),
++			                        (double)std::abs(rel.pose.position.z)});
++		}
++	}
++
++	// Filter output excursion must be well under the raw noise amplitude.
++	CHECK(max_abs_out < noise_amp);
++	CHECK(max_abs_out < noise_amp * 0.7);
++}
++
++// ---------------------------------------------------------------------------
++// Numerical stability
++// ---------------------------------------------------------------------------
++
++TEST_CASE("kalman: stays finite under extended mixed operation")
++{
++	// Run several thousand mixed IMU+pose samples describing a sinusoidal
++	// trajectory and assert the filter output never goes non-finite.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	for (int i = 0; i < 5000; i++) {
++		double tt = i * DT_S;
++		xrt_vec3 pos = {(float)(0.3 * std::sin(tt * 2.0)), (float)(0.2 * std::cos(tt * 1.5)),
++		                (float)(0.1 * std::sin(tt * 3.0))};
++		// Analytic world acceleration of the sinusoid.
++		xrt_vec3 a_world = {(float)(-0.3 * 4.0 * std::sin(tt * 2.0)),
++		                    (float)(-0.2 * 2.25 * std::cos(tt * 1.5)),
++		                    (float)(-0.1 * 9.0 * std::sin(tt * 3.0))};
++		feed_pose_and_imu(kf.get(), t, pos, IDENTITY_QUAT, a_world, ZERO_VEC);
++		t += DT_NS;
++
++		if (i % 50 == 0) {
++			xrt_space_relation rel{};
++			kf->get_prediction(t, &rel);
++			REQUIRE(std::isfinite(rel.pose.position.x));
++			REQUIRE(std::isfinite(rel.pose.position.y));
++			REQUIRE(std::isfinite(rel.pose.position.z));
++			REQUIRE(std::isfinite(rel.pose.orientation.w));
++			REQUIRE(std::isfinite(rel.linear_velocity.x));
++		}
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++	// After a bounded sinusoid the position must remain bounded.
++	CHECK(std::abs(rel.pose.position.x) < 2.0);
++	CHECK(std::abs(rel.pose.position.y) < 2.0);
++	CHECK(std::abs(rel.pose.position.z) < 2.0);
++}
++
++// ---------------------------------------------------------------------------
++// Responsiveness / dynamics
++// ---------------------------------------------------------------------------
++
++TEST_CASE("kalman: velocity estimate converges quickly")
++{
++	// Regression guard. A controller can change velocity in tens of ms, so
++	// the filter must converge its velocity estimate fast. Feed constant
++	// 1 m/s motion and require the estimate within 20 % after just 0.5 s.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	const double vx = 1.0;
++	int64_t t = 1000000;
++	double x = 0.0;
++	for (int i = 0; i < 250; i++) { // 0.5 s
++		feed_pose_and_imu(kf.get(), t, {(float)x, 0.0f, 0.0f}, IDENTITY_QUAT, ZERO_VEC, ZERO_VEC);
++		x += vx * DT_S;
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++	CHECK(rel.linear_velocity.x == Approx(vx).margin(0.2));
++	CHECK(rel.pose.position.x == Approx(x).margin(0.05));
++}
++
++TEST_CASE("kalman: tracks an abrupt velocity reversal")
++{
++	// The device moves +X at 1 m/s, then abruptly reverses to -X at 1 m/s.
++	// The filter must follow the reversal: end near the start, velocity now
++	// clearly negative. Catches a filter too sluggish to track direction
++	// changes (controllers reverse direction constantly).
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	double x = 0.0;
++	for (int i = 0; i < 300; i++) { // +X, 0.6 s
++		feed_pose_and_imu(kf.get(), t, {(float)x, 0.0f, 0.0f}, IDENTITY_QUAT, ZERO_VEC, ZERO_VEC);
++		x += 1.0 * DT_S;
++		t += DT_NS;
++	}
++	double x_peak = x;
++	for (int i = 0; i < 300; i++) { // -X, 0.6 s
++		feed_pose_and_imu(kf.get(), t, {(float)x, 0.0f, 0.0f}, IDENTITY_QUAT, ZERO_VEC, ZERO_VEC);
++		x -= 1.0 * DT_S;
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++	CHECK(x_peak > 0.5);                                       // sanity
++	CHECK(rel.pose.position.x == Approx(x).margin(0.06));      // followed back
++	CHECK(rel.linear_velocity.x < -0.5f);                      // velocity reversed
++}
++
++TEST_CASE("kalman: re-converges after an optical dropout")
++{
++	// Establish tracking at a fixed point, drop optical for 0.3 s (IMU
++	// only), then resume. The filter must re-lock to the true location.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	const xrt_vec3 home = {0.5f, 1.0f, 0.2f};
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++
++	for (int i = 0; i < 100; i++) {
++		feed_pose(kf.get(), t, home, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++	for (int i = 0; i < 150; i++) { // 0.3 s dropout
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++	for (int i = 0; i < 200; i++) { // resume
++		feed_pose(kf.get(), t, home, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++	CHECK(rel.pose.position.x == Approx(home.x).margin(0.05));
++	CHECK(rel.pose.position.y == Approx(home.y).margin(0.05));
++	CHECK(rel.pose.position.z == Approx(home.z).margin(0.05));
++}
++
++TEST_CASE("kalman: applies an optical pose that lags the filter clock")
++{
++	// With continuous IMU integration the filter clock tracks the latest
++	// IMU sample, so optical poses (stamped at camera-capture time) arrive
++	// behind it. They must still be applied as corrections, not skipped.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++	for (int i = 0; i < 60; i++) {
++		feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	// Feed poses stamped 60 ms behind the filter clock at a shifted point.
++	const xrt_vec3 shifted = {0.4f, 0.0f, 0.0f};
++	for (int i = 0; i < 250; i++) {
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC); // advances the clock
++		feed_pose(kf.get(), t - 30 * DT_NS, shifted, IDENTITY_QUAT);
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++	// The lagged poses were applied: position tracked to the shifted point.
++	CHECK(rel.pose.position.x == Approx(shifted.x).margin(0.08));
++}
++
++TEST_CASE("kalman: clear_position_tracked_flag clears the tracked bit")
++{
++	// The interface exposes clear_position_tracked_flag(); after a call the
++	// POSITION_TRACKED bit must be clear on the next prediction.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++	for (int i = 0; i < 60; i++) {
++		feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	xrt_space_relation before{};
++	kf->get_prediction(t, &before);
++	REQUIRE((before.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0);
++
++	kf->clear_position_tracked_flag();
++
++	xrt_space_relation after{};
++	kf->get_prediction(t, &after);
++	CHECK((after.relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) == 0);
++}
++
++TEST_CASE("kalman: an extended optical dropout stays finite and bounded")
++{
++	// Establish tracking at rest, then run 5 s with NO optical at all.
++	// The filter must not go non-finite, and a stationary controller must
++	// not be flung away by accumulated drift.
++	auto kf = KalmanFusionInterface::create();
++	REQUIRE(kf != nullptr);
++
++	int64_t t = 1000000;
++	const xrt_vec3 accel_rest = make_accel_body(IDENTITY_QUAT, ZERO_VEC);
++	for (int i = 0; i < 100; i++) {
++		feed_pose(kf.get(), t, ZERO_VEC, IDENTITY_QUAT);
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++	for (int i = 0; i < 2500; i++) { // 5 s, optical fully dropped
++		feed_imu(kf.get(), t, accel_rest, ZERO_VEC);
++		t += DT_NS;
++	}
++
++	xrt_space_relation rel{};
++	kf->get_prediction(t, &rel);
++	REQUIRE(std::isfinite(rel.pose.position.x));
++	REQUIRE(std::isfinite(rel.pose.position.y));
++	REQUIRE(std::isfinite(rel.pose.position.z));
++	REQUIRE(std::isfinite(rel.pose.orientation.w));
++	CHECK(std::abs(rel.pose.position.x) < 1.0);
++	CHECK(std::abs(rel.pose.position.y) < 1.0);
++	CHECK(std::abs(rel.pose.position.z) < 1.0);
++}
+-- 
+2.53.0
+

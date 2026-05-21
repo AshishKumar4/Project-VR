@@ -1,0 +1,6 @@
+# G2 VR performance — scoped passwordless: GPU clock/power pin (O-5), CPU governor,
+# and the monado real-time capability. No shell escape; these specific tools only.
+# Installed to /etc/sudoers.d/g2-vr-perf by install.sh; validated with `visudo -c`.
+mrwhite0racle ALL=(root) NOPASSWD: /usr/bin/nvidia-smi -pm *, /usr/bin/nvidia-smi -pl *, /usr/bin/nvidia-smi -lgc *, /usr/bin/nvidia-smi -lmc *, /usr/bin/nvidia-smi -rgc, /usr/bin/nvidia-smi -rmc, /usr/bin/nvidia-smi -c *
+mrwhite0racle ALL=(root) NOPASSWD: /usr/bin/cpupower frequency-set *
+mrwhite0racle ALL=(root) NOPASSWD: /usr/sbin/setcap cap_sys_nice+ep /home/mrwhite0racle/.local/bin/monado-service

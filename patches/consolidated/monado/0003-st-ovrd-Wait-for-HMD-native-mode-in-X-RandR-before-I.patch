@@ -1,0 +1,165 @@
+From 3caa3a6c9d12b4093acf8c78f36552dc9495b444 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Fri, 15 May 2026 21:52:18 -0400
+Subject: [PATCH 3/3] st/ovrd: Wait for HMD native mode in X RandR before
+ Init() returns
+
+vrserver starts vrcompositor immediately after the driver loads, and
+vrcompositor scans X RandR exactly once to find a direct-mode display
+matching the driver-reported HMD resolution. WMR headsets expose their
+native video mode on DisplayPort only a short time after the panel is
+powered up over USB, so vrcompositor can scan before the mode is
+enumerated and the direct-mode RandR lease then fails.
+
+Block at the end of CServerDriver_Monado::Init() until the HMD's native
+mode (whatever resolution the Monado HMD device reports) appears in X
+RandR, with a 20 s timeout. Generic to any headset, a fast no-op when
+the mode is already present, and returns immediately on sessions with
+no X so Wayland/headless callers proceed unaffected. Guarded by
+XRT_HAVE_XCB, which the CMake target now also exposes as a compile
+definition so the source can test it.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../state_trackers/steamvr_drv/CMakeLists.txt |  9 ++
+ .../steamvr_drv/ovrd_driver.cpp               | 86 +++++++++++++++++++
+ 2 files changed, 95 insertions(+)
+
+diff --git a/src/xrt/state_trackers/steamvr_drv/CMakeLists.txt b/src/xrt/state_trackers/steamvr_drv/CMakeLists.txt
+index 9e766f583..534e76dc0 100644
+--- a/src/xrt/state_trackers/steamvr_drv/CMakeLists.txt
++++ b/src/xrt/state_trackers/steamvr_drv/CMakeLists.txt
+@@ -15,3 +15,12 @@ target_link_libraries(
+ 		aux_generated_bindings_helpers
+ 		ovrd_generated_bindings
+ 	)
++
++# X RandR is used in Init() to wait for the HMD's native display mode to
++# enumerate before SteamVR's vrcompositor scans for a direct-mode display.
++# XRT_HAVE_XCB is CMake-only, so expose it to the source as a compile define.
++if(XRT_HAVE_XCB)
++	target_compile_definitions(st_ovrd PRIVATE XRT_HAVE_XCB)
++	target_include_directories(st_ovrd SYSTEM PRIVATE ${XCB_INCLUDE_DIRS})
++	target_link_libraries(st_ovrd PRIVATE ${XCB_LIBRARIES})
++endif()
+diff --git a/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp b/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
+index ddcd0f60f..7960c47be 100644
+--- a/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
++++ b/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
+@@ -32,6 +32,7 @@ extern "C" {
+ #include "util/u_builders.h"
+ #include "util/u_hand_tracking.h"
+ 
++#include "xrt/xrt_config_have.h"
+ #include "xrt/xrt_space.h"
+ #include "xrt/xrt_system.h"
+ #include "xrt/xrt_defines.h"
+@@ -39,6 +40,11 @@ extern "C" {
+ #include "xrt/xrt_instance.h"
+ 
+ #include "b_ovrd_generated_bindings.h"
++
++#ifdef XRT_HAVE_XCB
++#include <xcb/xcb.h>
++#include <xcb/randr.h>
++#endif
+ }
+ #include "math/m_vec3.h"
+ 
+@@ -62,6 +68,69 @@ DEBUG_GET_ONCE_NUM_OPTION(scale_percentage, "XRT_COMPOSITOR_SCALE_PERCENTAGE", 1
+ #undef DUMP_POSE
+ #undef DUMP_POSE_CONTROLLERS
+ 
++/*
++ * Some HMDs (notably Windows Mixed Reality headsets) only present their native
++ * video mode on the DisplayPort connector a short time after the device is
++ * activated over USB — the panel powers up and the display re-enumerates a few
++ * seconds later. SteamVR's vrcompositor scans X RandR exactly once at startup
++ * to find a direct-mode display matching the driver-reported HMD resolution; if
++ * it scans before the native mode is enumerated, the RandR lease fails and the
++ * compositor cannot start.
++ *
++ * To make the SteamVR driver robust, Init() blocks until the HMD's native mode
++ * is present in X RandR. Fully generic: it waits for whatever resolution the
++ * Monado HMD device reports, so it works for any headset; it is a fast no-op
++ * for HMDs that enumerate immediately, and returns false without delay on
++ * sessions with no X (Wayland/headless) so the caller proceeds regardless.
++ */
++static bool
++ovrd_wait_for_hmd_randr_mode(uint32_t want_w, uint32_t want_h, int timeout_ms)
++{
++#ifdef XRT_HAVE_XCB
++	const char *display_env = getenv("DISPLAY");
++	xcb_connection_t *conn = xcb_connect(display_env, NULL);
++	if (conn == NULL || xcb_connection_has_error(conn) != 0) {
++		if (conn != NULL) {
++			xcb_disconnect(conn);
++		}
++		return false;
++	}
++
++	xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
++	const int poll_ms = 100;
++	bool found = false;
++
++	for (int waited = 0; waited <= timeout_ms && !found; waited += poll_ms) {
++		xcb_randr_get_screen_resources_cookie_t cookie =
++		    xcb_randr_get_screen_resources(conn, screen->root);
++		xcb_randr_get_screen_resources_reply_t *res =
++		    xcb_randr_get_screen_resources_reply(conn, cookie, NULL);
++		if (res != NULL) {
++			xcb_randr_mode_info_t *modes = xcb_randr_get_screen_resources_modes(res);
++			int mode_count = xcb_randr_get_screen_resources_modes_length(res);
++			for (int i = 0; i < mode_count; i++) {
++				if (modes[i].width == want_w && modes[i].height == want_h) {
++					found = true;
++					break;
++				}
++			}
++			free(res);
++		}
++		if (!found) {
++			os_nanosleep((int64_t)poll_ms * 1000 * 1000);
++		}
++	}
++
++	xcb_disconnect(conn);
++	return found;
++#else
++	(void)want_w;
++	(void)want_h;
++	(void)timeout_ms;
++	return false;
++#endif
++}
++
+ 
+ /*
+  * Controller
+@@ -1664,6 +1733,23 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
+ 	m_xhmd = m_xsysd->static_roles.head;
+ 
+ 	ovrd_log("Selected HMD %s\n", m_xhmd->str);
++
++	// Block until the HMD's native video mode is enumerated by X RandR before
++	// returning from Init(). vrserver brings up vrcompositor immediately after
++	// the driver loads, and vrcompositor scans RandR once to find a direct-mode
++	// display matching the driver-reported HMD resolution. WMR headsets only
++	// expose their native mode a few seconds after USB activation, so without
++	// this wait vrcompositor scans too early and the direct-mode lease fails.
++	if (m_xhmd->hmd != NULL && m_xhmd->hmd->screens[0].w_pixels > 0) {
++		uint32_t want_w = (uint32_t)m_xhmd->hmd->screens[0].w_pixels;
++		uint32_t want_h = (uint32_t)m_xhmd->hmd->screens[0].h_pixels;
++		ovrd_log("Waiting for HMD display mode %ux%u to enumerate in X RandR...\n", want_w, want_h);
++		bool ready = ovrd_wait_for_hmd_randr_mode(want_w, want_h, 20000);
++		ovrd_log("HMD display mode %ux%u in RandR: %s\n", want_w, want_h,
++		         ready ? "present — vrcompositor can lease it"
++		               : "not seen (timeout/no-X) — proceeding anyway");
++	}
++
+ 	m_MonadoDeviceDriver = new CDeviceDriver_Monado(m_xinst, m_xhmd);
+ 	//! @todo provide a serial number
+ 	vr::VRServerDriverHost()->TrackedDeviceAdded(m_xhmd->str, vr::TrackedDeviceClass_HMD, m_MonadoDeviceDriver);
+-- 
+2.53.0
+

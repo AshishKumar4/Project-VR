@@ -1,0 +1,65 @@
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Wed, 20 May 2026 14:55:00 +0000
+Subject: [PATCH] backends/native/drm-lease: complete bookkeeping when kernel
+ has already auto-revoked the lease
+
+When a DRM lease holder closes its lease fd (e.g. SteamVR's vrcompositor
+exits or crashes), the kernel auto-revokes the lease. The next time
+mutter's meta_drm_lease_revoke() runs against that MetaDrmLease, the
+DRM_IOCTL_MODE_REVOKE_LEASE ioctl returns -ENOENT because the kernel
+has no record of the lease anymore.
+
+The current code logs a warning and returns early without calling
+mark_revoked(). That early return is wrong: it leaves the lease's
+LeasingKmsAssignment list in place, each of which holds a CRTC with
+meta_kms_crtc_set_is_leased (crtc, TRUE). Mutter's atomic commit code
+still believes those CRTCs are leased to someone else and emits the
+CRTC into the atomic state in a configuration the kernel rejects with
+EINVAL. The visible symptom is
+
+    Direct scanout page flip failed: drmModeAtomicCommit: Invalid argument
+    Page flip failed: drmModeAtomicCommit: Invalid argument
+    Failed to post KMS update: drmModeAtomicCommit: Invalid argument
+
+followed by no further frames reaching the desktop monitors (input still
+flows, mutter's main loop is alive, but scanout is wedged). The user
+sees this as "windows go weird, can't click, frozen-but-not-quite";
+switching to a VT and back forces a DRM reset and recovers.
+
+ENOENT from drmModeRevokeLease() is not a failure -- it is the normal
+result of "the kernel beat us to it." Treat it as success and proceed
+with mark_revoked(), which calls meta_drm_lease_unassign() (clears
+is_leased on each CRTC) and emits the LEASE_REVOKED signal so the lease
+manager can finalize its state.
+
+For any other errno (real failure), keep the current behaviour: log,
+do not clean up bookkeeping (because the lease really is still active
+in the kernel).
+
+Forwarded: no
+Last-Update: 2026-05-20
+Index: mutter-50.1/src/backends/native/meta-drm-lease.c
+===================================================================
+--- mutter-50.1.orig/src/backends/native/meta-drm-lease.c
++++ mutter-50.1/src/backends/native/meta-drm-lease.c
+@@ -411,6 +411,20 @@ meta_drm_lease_revoke (MetaDrmLease *lea
+ 
+   if (!meta_kms_device_revoke_lease (lease->kms_device, lease->lessee_id, &error))
+     {
++      /* If the kernel has already auto-revoked the lease (because the
++       * lease holder closed its fd, e.g. vrcompositor crashed or exited),
++       * the ioctl returns ENOENT. That is not a failure on our part --
++       * the lease really is gone -- and we still need to complete the
++       * bookkeeping (clear is_leased on the CRTCs, emit LEASE_REVOKED,
++       * zero the lessee_id) so subsequent atomic commits do not include
++       * those CRTCs in a kernel-incompatible state.
++       */
++      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND))
++        {
++          mark_revoked (lease);
++          return;
++        }
++
+       g_warning ("Failed to revoke DRM lease on %s: %s",
+                  meta_kms_device_get_path (lease->kms_device),
+                  error->message);

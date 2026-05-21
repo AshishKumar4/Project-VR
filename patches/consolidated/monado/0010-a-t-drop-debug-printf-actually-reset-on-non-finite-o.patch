@@ -1,0 +1,50 @@
+From 4139d4960329405a2578e8c9fb10cf14b04c9691 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Thu, 21 May 2026 16:34:38 -0400
+Subject: [PATCH 10/10] a/t: drop debug printf + actually reset on non-finite
+ optical correction
+
+Audit follow-ups: remove the per-frame "kalman: optical pose ... applying"
+debug printf (log spam left from bring-up), and make the correctUnscented-failure
+path call reset_filter() so a PoseResult::RESET genuinely means the filter was
+reset (matching the residual-overflow path and the caller's assumption).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../auxiliary/tracking/t_tracker_kalman_fusion.cpp  | 13 +++----------
+ 1 file changed, 3 insertions(+), 10 deletions(-)
+
+diff --git a/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp b/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
+index 4d10974f7..fb150c1be 100644
+--- a/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
++++ b/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
+@@ -539,7 +539,9 @@ namespace {
+ 		    flexkalman::correctUnscented(filter_state, pos_meas)) {
+ 			return PoseResult::ACCEPTED;
+ 		}
+-		return PoseResult::RESET; // non-finite correction; caller resets
++		// Non-finite correction — reset so RESET genuinely means "filter reset".
++		reset_filter();
++		return PoseResult::RESET;
+ 	}
+ 
+ 	bool
+@@ -688,15 +690,6 @@ namespace {
+ 		{
+ 			std::lock_guard<std::mutex> lock(m_filter_lock);
+ 
+-			// Debug (kept until on-headset validation): how the optical
+-			// pose timestamp relates to the filter clock. With continuous
+-			// IMU integration an optical pose — stamped at camera-capture
+-			// time — normally arrives slightly behind the clock.
+-			if (filter_time_ns != 0) {
+-				printf("kalman: optical pose %+lld ns vs filter clock; applying.\n",
+-				       (long long)(sample->timestamp_ns - filter_time_ns));
+-			}
+-
+ 			// predict_filter_to only advances the filter forward; a
+ 			// lagging pose is applied as a correction at the current
+ 			// state. Its latency introduces at most a (velocity * latency)
+-- 
+2.53.0
+

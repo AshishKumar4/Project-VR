@@ -1,0 +1,280 @@
+From 55909dd65aa5a7bfe03b0813bfaf4512637bfecb Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Fri, 15 May 2026 22:58:54 -0400
+Subject: [PATCH 04/10] a/t,d/wmr: Finish the controller Kalman fusion
+
+The merged Kalman fusion ("Broken but integrated kalman filter") was an
+unfinished prototype. Complete it:
+
+- AccelerometerMeasurement: predictMeasurement mixed frames
+  (gravity_ref + q*(accel-bias)). Replace with the correct body-frame
+  specific-force model, q.conjugate()*(acceleration - g_world) +
+  accelBias, so the accelerometer genuinely informs the filter.
+
+- integrate_imu_sample: feed the real accelerometer reading instead of
+  the stubbed Vector3d::Zero(), kept in the body frame to match the
+  measurement model.
+
+- process_imu_data: integrate each IMU sample as it arrives so the
+  filter advances continuously and dead-reckons through optical
+  dropouts instead of freezing at the last pose; process_pose applies
+  optical poses even when they lag the filter clock (optical latency).
+
+- Tune the process model: stock damping (0.3/0.01) decayed velocity to
+  30%/s, and process-noise 0.01 made the filter so over-confident its
+  velocity estimate took seconds to converge. Use gentle damping
+  (~19 s time constant) and process noise that converges velocity in
+  ~0.4 s.
+
+- Remove the vestigial SimpleIMUFusion (fed every sample, never read).
+
+- WMR controller driver: pass NULL measurement variances so the real
+  driver uses the fusion's tuned, test-validated internal defaults.
+
+Validated by the new t_tracker_kalman_fusion test suite.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../flexkalman/AccelerometerMeasurement.h     | 12 ++-
+ .../tracking/t_tracker_kalman_fusion.cpp      | 90 ++++++++++++++-----
+ src/xrt/drivers/wmr/wmr_controller_base.c     | 16 ++--
+ 3 files changed, 88 insertions(+), 30 deletions(-)
+
+diff --git a/src/external/flexkalman/flexkalman/AccelerometerMeasurement.h b/src/external/flexkalman/flexkalman/AccelerometerMeasurement.h
+index 58cb8c9ad..e7914b50d 100644
+--- a/src/external/flexkalman/flexkalman/AccelerometerMeasurement.h
++++ b/src/external/flexkalman/flexkalman/AccelerometerMeasurement.h
+@@ -40,9 +40,17 @@ class AccelerometerMeasurement
+ 
+     template<typename State>
+     MeasurementVector predictMeasurement(State const &s) const {
+-        // TODO: Find a way to separate gravity from acceleration
++        // An accelerometer measures specific force in the sensor (body)
++        // frame: the proper acceleration that opposes gravity. Physically
++        //   a_meas = R_world->body * (a_world - g_world) + accelBias
++        // where a_world is the body's linear acceleration (carried in the
++        // pose state) and g_world is gravitational acceleration (gravity_ref_,
++        // e.g. (0,-9.81,0)). The state quaternion q is body->world, so
++        // R_world->body == q.conjugate(). At rest (a_world == 0) this
++        // correctly predicts -R*g_world, i.e. the upward gravity reaction.
+         auto q = s.a().getCombinedQuaternion();
+-        return gravity_ref_ + q * (s.a().acceleration() - s.b().accelBias());
++        return q.conjugate() * (s.a().acceleration() - gravity_ref_) +
++               s.b().accelBias();
+     }
+ 
+     template<typename State>
+diff --git a/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp b/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
+index 9a62dd4e1..27e31b2bd 100644
+--- a/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
++++ b/src/xrt/auxiliary/tracking/t_tracker_kalman_fusion.cpp
+@@ -24,13 +24,13 @@
+ 
+ #include "tracking/t_tracker_kalman_fusion.hpp"
+ #include "tracking/t_fusion.hpp"
+-#include "tracking/t_imu_fusion.hpp"
+ 
+ #include "math/m_eigen_interop.hpp"
+ #include "math/m_api.h"
+ 
+ #include "os/os_time.h"
+ 
++#include "util/u_debug.h"
+ #include "util/u_misc.h"
+ #include "util/u_var.h"
+ 
+@@ -185,6 +185,34 @@ namespace {
+ 	public:
+ 		EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+ 
++		KalmanFusion()
++		{
++			// The stock PoseSeparatelyDampedConstantVelocity damping
++			// (0.3 linear / 0.01 angular) attenuates velocity to ~30 %
++			// per second and angular velocity to ~1 % per second. That
++			// is far too aggressive for a VR controller in sustained
++			// motion: it continuously crushes the velocity estimate, so
++			// the filter lags real motion and the forward prediction is
++			// short. Use gentle damping (~0.95/s retention, ~19 s time
++			// constant) so genuine motion is preserved while a runaway
++			// velocity during a long optical dropout still bleeds off.
++			// combined_process_model holds a *reference* to
++			// main_process_model, so this configures both the predict
++			// and the prediction-extrapolation paths.
++			main_process_model.setDamping(0.95, 0.95);
++
++			// Process-noise autocorrelation. The stock 0.01 linear value
++			// makes the filter badly over-confident: its velocity
++			// estimate converges over several seconds, so it lags real
++			// motion (a controller can change velocity in tens of ms).
++			// A larger value lets position/IMU measurements update the
++			// velocity estimate quickly. Bracketed by the test suite:
++			// large enough that constant-velocity motion is tracked
++			// without lag, small enough that noisy optical poses are
++			// still smoothed.
++			main_process_model.setNoiseAutocorrelation(1.0, 0.5);
++		}
++
+ 		void
+ 		clear_position_tracked_flag() override;
+ 
+@@ -230,8 +258,6 @@ namespace {
+ 		ProcessModelB bias_process_model;
+ 		CombinedProcessModel combined_process_model{main_process_model, bias_process_model};
+ 
+-		SimpleIMUFusion imu;
+-
+ 		timepoint_ns filter_time_ns{0};
+ 		bool tracked{false};
+ 		TrackingInfo orientation_state;
+@@ -246,9 +272,9 @@ namespace {
+ 
+ 		//! Recording info
+ 		std::string m_device_name;
+-		bool m_recording;                    //!< Whether samples are being recorded
++		bool m_recording = false;            //!< Whether samples are being recorded
+ 		struct u_var_button m_recording_btn; //!< UI button to start/stop `recording`
+-		ImuPoseRecorder *m_recorder;
++		ImuPoseRecorder *m_recorder = nullptr;
+ 
+ 		static void
+ 		recorder_btn_cb(void *ptr)
+@@ -287,7 +313,6 @@ namespace {
+ 	{
+ 		reset_filter();
+ 		orientation_state = TrackingInfo{};
+-		imu = SimpleIMUFusion{};
+ 	}
+ 
+ 	bool
+@@ -321,16 +346,15 @@ namespace {
+ 	bool
+ 	KalmanFusion::integrate_imu_sample(xrt_imu_sample &sample, Vector3d &accel_variance, Vector3d &gyro_variance)
+ 	{
+-		//! @todo use better measurements instead of the preceding "simple
+-		//! fusion"
++		// g_world: gravitational acceleration in the world frame (Y-up).
+ 		const Vector3d G = Vector3d::UnitY() * -MATH_GRAVITY_M_S2;
++		// Accelerometer reading is kept in the sensor (body) frame: the
++		// AccelerometerMeasurement model predicts body-frame specific force
++		// directly, so this must NOT be pre-rotated into the world frame.
+ 		Vector3d acc = map_vec3_f64(sample.accel_m_s2);
+-		Vector3d gyro = map_vec3_f64(sample.gyro_rad_secs);
+-
+-		// TODO: Figure out the acceleration.
+-		acc = Vector3d::Zero();
+-
+-		gyro = filter_state.getQuaternion() * gyro;
++		// Gyro is rotated into the world frame to match the state's
++		// angularVelocity(), which BiasedGyroMeasurement compares against.
++		Vector3d gyro = filter_state.getQuaternion() * map_vec3_f64(sample.gyro_rad_secs);
+ 
+ 		auto acc_meas = AccelerometerMeasurement{acc, G, accel_variance};
+ 		auto gyro_meas = BiasedGyroMeasurement{gyro, gyro_variance};
+@@ -385,6 +409,12 @@ namespace {
+ 	                               const struct xrt_vec3 *accel_variance_optional,
+ 	                               const struct xrt_vec3 *gyro_variance_optional)
+ 	{
++		// Default measurement noise (variance) for the controller IMU when
++		// the caller does not supply per-sample values. These are the
++		// tuned, test-validated defaults — the WMR controller driver passes
++		// NULL so the real driver uses exactly what the test suite verifies.
++		// accel: (m/s^2)^2, gyro: (rad/s)^2 — std ~0.1 of each, a deliberately
++		// conservative estimate for a consumer MEMS controller IMU.
+ 		Vector3d accel_variance = Vector3d::Constant(0.01);
+ 		Vector3d gyro_variance = Vector3d::Constant(0.01);
+ 		if (accel_variance_optional) {
+@@ -394,10 +424,6 @@ namespace {
+ 			gyro_variance = map_vec3(*gyro_variance_optional).cast<double>();
+ 		}
+ 
+-		imu.handleAccel(map_vec3_f64(sample->accel_m_s2), sample->timestamp_ns);
+-		imu.handleGyro(map_vec3_f64(sample->gyro_rad_secs), sample->timestamp_ns);
+-		imu.postCorrect();
+-
+ 		if (tracked) {
+ 			// TODO: Prevent the queue from getting too big.
+ 			// assert(ff_samples.size() <= 1024);
+@@ -408,6 +434,14 @@ namespace {
+ 
+ 			ff_samples.push(*sample);
+ 			ff_sample_variance.push({accel_variance, gyro_variance});
++
++			// Integrate the IMU sample into the filter as soon as it
++			// arrives, so the filter time advances continuously. This is
++			// what lets the filter dead-reckon (gyro + accelerometer)
++			// through optical-tracking dropouts instead of freezing at
++			// the last optical pose. The queue is drained immediately
++			// here, so it normally holds at most a single sample.
++			integrate_samples_up_to(sample->timestamp_ns);
+ 		}
+ 
+ 		if (m_recorder) {
+@@ -430,14 +464,26 @@ namespace {
+ 			orientation_variance = map_vec3(*orientation_variance_optional).cast<double>();
+ 		}
+ 
++		// With continuous IMU integration (see process_imu_data) the filter
++		// time tracks the most recent IMU sample, so an optical pose —
++		// timestamped when its camera frame was captured — normally arrives
++		// slightly "in the past" relative to filter_time_ns. We still apply
++		// it: the optical pose is the filter's only absolute position/
++		// orientation anchor. The optical latency introduces at most a
++		// (velocity * latency) offset, which the measurement variances and
++		// the residual limit absorb. Skipping the pose (the old behaviour)
++		// would discard that anchor and let the filter drift on IMU alone.
+ 		if (sample->timestamp_ns < filter_time_ns) {
+-			printf("Skipping old pose sample, filter_time=%zu, ts=%zu.\n", filter_time_ns,
++			printf("Optical pose %lld ns behind filter_time (latency); applying. "
++			       "filter_time=%zu, ts=%zu.\n",
++			       (long long)(filter_time_ns - sample->timestamp_ns), filter_time_ns,
+ 			       sample->timestamp_ns);
+-			return;
++		} else {
++			printf("Optical pose ahead of filter_time; integrating IMU forward. "
++			       "filter_time=%zu, ts=%zu.\n",
++			       filter_time_ns, sample->timestamp_ns);
+ 		}
+ 
+-		printf("didnt skip old sample, filter_time=%zu, ts=%zu.\n", filter_time_ns, sample->timestamp_ns);
+-
+ 		integrate_samples_up_to(sample->timestamp_ns);
+ 
+ 		if (integrate_pose(sample->pose, position_variance, orientation_variance, residual_limit)) {
+diff --git a/src/xrt/drivers/wmr/wmr_controller_base.c b/src/xrt/drivers/wmr/wmr_controller_base.c
+index 191b3787c..e36bd164c 100644
+--- a/src/xrt/drivers/wmr/wmr_controller_base.c
++++ b/src/xrt/drivers/wmr/wmr_controller_base.c
+@@ -124,9 +124,10 @@ wmr_controller_base_imu_sample(struct wmr_controller_base *wcb,
+ 	    .timestamp_ns = mono_time_ns,
+ 	    .gyro_rad_secs = {imu_sample->gyro.x, imu_sample->gyro.y, imu_sample->gyro.z},
+ 	    .accel_m_s2 = {imu_sample->acc.x, imu_sample->acc.y, imu_sample->acc.z}};
+-	struct xrt_vec3 accel_variance = {0.01, 0.01, 0.01};
+-	struct xrt_vec3 gyro_variance = {0.01, 0.01, 0.01};
+-	kalman_fusion_process_imu_data(wcb->kalman_fusion, &k_imu_sample, &accel_variance, &gyro_variance);
++	// Pass NULL variances so the fusion uses its tuned, test-validated
++	// internal defaults — keeping the real driver's behaviour identical to
++	// what the t_tracker_kalman_fusion test suite verifies.
++	kalman_fusion_process_imu_data(wcb->kalman_fusion, &k_imu_sample, NULL, NULL);
+ }
+ 
+ static void
+@@ -1157,9 +1158,12 @@ wmr_controller_base_push_observed_pose(struct xrt_device *xdev, timepoint_ns fra
+ 	wcb->last_tracked_pose = *pose;
+ 
+ 	struct xrt_pose_sample sample = {.pose = *pose, .timestamp_ns = frame_mono_ns};
+-	struct xrt_vec3 position_variance = {1.e-6, 1.e-6, 1.e-6};
+-	struct xrt_vec3 orientation_variance = {1.e-3, 1.e-5, 1.e-3};
+-	kalman_fusion_process_pose(wcb->kalman_fusion, &sample, &position_variance, &orientation_variance, 15);
++	// Pass NULL variances so the fusion uses its tuned, test-validated
++	// internal defaults (the previous hard-coded 1e-6 position variance
++	// claimed 1 mm optical precision, which is optimistic for constellation
++	// tracking and was never test-validated). residual_limit stays generous
++	// so only a catastrophic optical glitch forces a filter reset.
++	kalman_fusion_process_pose(wcb->kalman_fusion, &sample, NULL, NULL, 15);
+ 
+ 	if (wcb->update_yaw_from_optical) {
+ #if 1
+-- 
+2.53.0
+

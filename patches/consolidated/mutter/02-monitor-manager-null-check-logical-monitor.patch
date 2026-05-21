@@ -1,0 +1,97 @@
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Wed, 20 May 2026 13:50:00 +0000
+Subject: [PATCH] backends/monitor-manager: NULL-check logical_monitor before dereference
+
+After meta_monitor_manager_rebuild() completes for a new config, callers
+sometimes assume "monitor->current_mode != NULL => monitor->logical_monitor
+!= NULL". That invariant is *not* upheld by the rebuild path: the
+higher-level meta_monitor_manager_apply_monitors_config() runs
+meta_monitor_update_current_mode() over every monitor after the rebuild,
+which re-discovers current_mode from hardware CRTC state. A monitor whose
+output is still assigned in hardware (e.g. just hot-plugged, or in a
+transient state between config swaps) gets a non-NULL current_mode even
+though it was not included in the new MetaMonitorsConfig and therefore was
+never associated with a MetaLogicalMonitor by update_logical_state().
+
+When this happens, two sites dereference NULL:
+
+  - update_current_monitor_mode_scale (called via g_list_foreach over
+    manager->monitors right after apply_monitors_config()) calls
+    meta_logical_monitor_get_scale() on the NULL pointer -> SIGSEGV.
+    Confirmed by coredump: PID 65271, /usr/bin/gnome-shell --mode=gdm,
+    triggered by HP Reverb G2 EDID re-read storm.
+
+  - handle_orientation_change passes the result to
+    meta_logical_monitor_get_transform() without checking. Guarded by
+    meta_monitor_is_active() but is_active checks current_mode, not
+    logical_monitor, so the same invariant violation applies. Latent.
+
+Apply the upstream pattern (already present at
+meta_monitor_manager_get_monitor_for_connector, line 4211): guard the
+dereference with a NULL check on the logical_monitor pointer. Return early
+when there is no logical_monitor for this monitor -- the value cannot be
+computed in that state, and the next rebuild that places the monitor into
+a config will re-fire the relevant computations.
+
+Forwarded: no
+Last-Update: 2026-05-20
+Index: mutter-50.1/src/backends/meta-monitor-manager.c
+===================================================================
+--- mutter-50.1.orig/src/backends/meta-monitor-manager.c
++++ mutter-50.1/src/backends/meta-monitor-manager.c
+@@ -539,6 +539,17 @@ update_current_monitor_mode_scale (MetaM
+     return;
+ 
+   logical_monitor = meta_monitor_get_logical_monitor (monitor);
++  /* meta_monitor_update_current_mode() (called from the higher-level
++   * apply_monitors_config right before this foreach) can re-discover
++   * current_mode from hardware CRTC state and set it on monitors that
++   * are not part of the new MetaMonitorsConfig. Those monitors never
++   * had a logical_monitor assigned by update_logical_state(), so the
++   * implicit "current_mode => logical_monitor" invariant is broken
++   * here. Skip; the next rebuild that places this monitor into a
++   * config will recompute the scale. */
++  if (!logical_monitor)
++    return;
++
+   scale = meta_logical_monitor_get_scale (logical_monitor);
+ 
+   meta_monitor_set_default_scale (monitor, monitor_mode, scale);
+@@ -905,6 +916,12 @@ handle_orientation_change (MetaOrientati
+   transform = meta_orientation_to_transform (orientation);
+ 
+   builtin_logical_monitor = meta_monitor_get_logical_monitor (builtin_monitor);
++  /* meta_monitor_is_active() above checks current_mode, not the
++   * logical_monitor pointer. They can disagree right after a config swap
++   * (see update_current_monitor_mode_scale comment), so guard the
++   * dereference here too. */
++  if (!builtin_logical_monitor)
++    return;
+   panel_transform =
+     meta_monitor_crtc_to_logical_transform (builtin_monitor, transform);
+   if (meta_logical_monitor_get_transform (builtin_logical_monitor) ==
+@@ -4205,10 +4222,21 @@ meta_monitor_manager_get_monitor_for_con
+   for (l = manager->monitors; l; l = l->next)
+     {
+       MetaMonitor *monitor = l->data;
++      MetaLogicalMonitor *logical_monitor;
++
++      if (!meta_monitor_is_active (monitor))
++        continue;
++      if (g_strcmp0 (connector, meta_monitor_get_connector (monitor)) != 0)
++        continue;
++
++      /* Defensive: even with the meta_monitor_update_current_mode invariant
++       * fix, an external caller could still hit a transient state during
++       * rebuild. Prefer "not associated" over SIGSEGV. */
++      logical_monitor = meta_monitor_get_logical_monitor (monitor);
++      if (!logical_monitor)
++        return -1;
+ 
+-      if (meta_monitor_is_active (monitor) &&
+-          g_strcmp0 (connector, meta_monitor_get_connector (monitor)) == 0)
+-        return meta_monitor_get_logical_monitor (monitor)->number;
++      return logical_monitor->number;
+     }
+ 
+   return -1;

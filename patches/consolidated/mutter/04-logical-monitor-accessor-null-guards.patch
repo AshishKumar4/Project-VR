@@ -1,0 +1,131 @@
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Wed, 20 May 2026 15:10:00 +0000
+Subject: [PATCH] backends/logical-monitor: g_return_*_if_fail on accessors
+
+The five thin MetaLogicalMonitor accessors (_get_layout, _get_scale,
+_get_transform, _get_number, _is_primary) and _get_monitors do an
+unconditional pointer dereference of their @logical_monitor argument.
+The contract documents the argument as non-NULL, but in practice many
+in-tree callers can be holding NULL because mutter's design legitimately
+puts a monitor through transient states where it is "active" (has a
+current_mode) but is not in the active MetaMonitorsConfig and therefore
+has no logical_monitor association yet. See meta_monitor_update_outputs()
+in meta-monitor.c -- it sets logical_monitor to NULL on entry to a
+rebuild -- and meta_monitor_manager_rebuild()'s early return at
+in_init==TRUE which deliberately skips update_logical_state().
+
+Today's audit (driven by SIGSEGV crashes during HP Reverb G2 hot-plug)
+identified at least these unguarded call sites:
+
+  src/wayland/meta-wayland-outputs.c              send_output_events,
+                                                  send_xdg_output_events,
+                                                  meta_wayland_output_set_monitor
+  src/backends/meta-monitor-manager.c             update_current_monitor_mode_scale,
+                                                  handle_orientation_change,
+                                                  meta_monitor_manager_get_monitor_for_connector
+  src/backends/native/meta-cursor-renderer-native.c (cursor scanout fallback)
+  src/backends/meta-screen-cast-monitor-stream-src.c (8 sites in screencast)
+
+Rather than patch every callsite as new ones are discovered (and risk
+missing future regressions), guard the accessors at the API boundary --
+mutter's standard pattern (642 g_return_*_if_fail occurrences in
+src/). The chosen defaults are the semantic identity for each return
+type:
+
+  _get_layout     -> (MtkRectangle){0,0,0,0}     (empty area)
+  _get_scale      -> 1.0f                        (identity scale)
+  _get_transform  -> MTK_MONITOR_TRANSFORM_NORMAL (identity transform)
+  _get_number     -> -1                          (matches "not found")
+  _is_primary     -> FALSE                       (definitionally)
+  _get_monitors   -> NULL                        (empty list)
+
+All callers tolerate these defaults: the per-callsite guards we already
+have (debian/patches/ubuntu/{wayland-outputs,monitor-manager}-null-check-*)
+short-circuit BEFORE reaching the accessor, so this patch is purely
+defensive coverage for current and future call sites we have not
+explicitly guarded.
+
+When the precondition is violated mutter emits a CRITICAL warning via
+g_return_*_if_fail, which makes the bug visible in journal logs rather
+than crashing the compositor.
+
+Forwarded: no
+Last-Update: 2026-05-20
+Index: mutter-50.1/src/backends/meta-logical-monitor.c
+===================================================================
+--- mutter-50.1.orig/src/backends/meta-logical-monitor.c
++++ mutter-50.1/src/backends/meta-logical-monitor.c
+@@ -169,30 +169,41 @@ meta_logical_monitor_add_monitor (MetaLo
+ gboolean
+ meta_logical_monitor_is_primary (MetaLogicalMonitor *logical_monitor)
+ {
++  g_return_val_if_fail (logical_monitor != NULL, FALSE);
++
+   return logical_monitor->is_primary;
+ }
+ 
+ void
+ meta_logical_monitor_make_primary (MetaLogicalMonitor *logical_monitor)
+ {
++  g_return_if_fail (logical_monitor != NULL);
++
+   logical_monitor->is_primary = TRUE;
+ }
+ 
+ float
+ meta_logical_monitor_get_scale (MetaLogicalMonitor *logical_monitor)
+ {
++  g_return_val_if_fail (logical_monitor != NULL, 1.0f);
++
+   return logical_monitor->scale;
+ }
+ 
+ MtkMonitorTransform
+ meta_logical_monitor_get_transform (MetaLogicalMonitor *logical_monitor)
+ {
++  g_return_val_if_fail (logical_monitor != NULL, MTK_MONITOR_TRANSFORM_NORMAL);
++
+   return logical_monitor->transform;
+ }
+ 
+ MtkRectangle
+ meta_logical_monitor_get_layout (MetaLogicalMonitor *logical_monitor)
+ {
++  g_return_val_if_fail (logical_monitor != NULL,
++                        ((MtkRectangle) { 0, 0, 0, 0 }));
++
+   return logical_monitor->rect;
+ }
+ 
+@@ -203,11 +214,13 @@ meta_logical_monitor_get_layout (MetaLog
+  * Returns the [class@Meta.Monitor]s number which is compatible with the monitor
+  * API on [class@Meta.Display] until the next monitors-changed.
+  *
+- * Returns: The [class@Meta.Monitor]s number
++ * Returns: The [class@Meta.Monitor]s number, or -1 if @logical_monitor is %NULL
+  */
+ int
+ meta_logical_monitor_get_number (MetaLogicalMonitor *logical_monitor)
+ {
++  g_return_val_if_fail (logical_monitor != NULL, -1);
++
+   return logical_monitor->number;
+ }
+ 
+@@ -217,12 +230,14 @@ meta_logical_monitor_get_number (MetaLog
+  *
+  * Returns the list of [class@Meta.Monitor]s.
+  *
+- * Returns: (transfer none) (element-type Meta.Monitor):
+- * The list of [class@Meta.Monitor]s.
++ * Returns: (transfer none) (element-type Meta.Monitor) (nullable):
++ * The list of [class@Meta.Monitor]s, or %NULL if @logical_monitor is %NULL.
+  */
+ GList *
+ meta_logical_monitor_get_monitors (MetaLogicalMonitor *logical_monitor)
+ {
++  g_return_val_if_fail (logical_monitor != NULL, NULL);
++
+   return logical_monitor->monitors;
+ }
+ 

@@ -1,0 +1,42 @@
+# Upstream source trees — separate repos with their own history, built in place.
+/src/
+# Regenerable NVIDIA module rollback backups.
+/module-backup-*/
+# Local-only / internal — never upload (kept on disk, out of the repo).
+/backups/
+/diagnostics/
+/bench/
+/recon/
+/state/
+/edid/
+/tests/
+/patches/legacy/
+/patches/_index_sources/
+/patches/README.md
+/docs/PLAN.md
+/docs/STATUS.md
+/docs/BUGS.md
+/docs/INVENTORY.md
+/docs/RESEARCH.md
+/docs/INFRASTRUCTURE-SPEC.md
+/docs/POST-REBOOT-CHECKLIST.md
+/docs/ROLLBACK.md
+/docs/PERFORMANCE-OPTIMIZATIONS.md
+/docs/PERFORMANCE-OPTIMIZATIONS-SYNTHESIS.md
+/tools/analyze2.py
+/tools/analyze_kalman.py
+/tools/build-track-a.sh
+/tools/install-patched-modules.sh
+# Python / build cruft.
+__pycache__/
+*.pyc
+*.o
+# Compiled probe binary (built from vkdisplays.c).
+/vkdisplays
+# Stale pre-upgrade / working-state backups + research scratch (kept on disk, not tracked).
+/pre-26.04-snapshot-*/
+/steamvr-monado-working-backup-*/
+/kalman-data/
+/logs/
+# Internal audit report — kept on disk for context, not upstreamed.
+/AUDIT.md

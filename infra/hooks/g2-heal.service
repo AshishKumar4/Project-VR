@@ -1,0 +1,8 @@
+[Unit]
+Description=Heal the G2-on-Linux/NVIDIA stack after a system update
+
+[Service]
+Type=oneshot
+# Consume the flag first so a heal that needs attention can't loop the path unit.
+ExecStartPre=/bin/rm -f %h/g2-studio/var/drift
+ExecStart=%h/.local/bin/g2ctl heal --auto

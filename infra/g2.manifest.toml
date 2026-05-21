@@ -1,0 +1,43 @@
+# g2.manifest.toml — single source of truth for the G2-on-Linux/NVIDIA stack.
+#
+# Read by g2ctl (status / verify / heal / doctor) and the apt hook.
+# DATA ONLY — the heal logic lives in g2ctl. Keep this minimal: to support a new
+# machine or HMD you edit values here, not code.
+
+[meta]
+workspace = "/home/mrwhite0racle/g2-linux-research"
+user      = "mrwhite0racle"
+log_dir   = "/home/mrwhite0racle/g2-studio/var/heal"
+
+# NVIDIA open kernel modules — our patches rebase onto the upstream tag; build +
+# MOK-sign + install + apt-hold via the scripts/ suite. Loading needs a reboot.
+[components.nvidia]
+repo         = "src/open-gpu-kernel-modules"
+branch_glob  = "g2-patches-on-*"                 # branch name encodes its base tag
+patches      = "patches/consolidated/nvidia"     # portable export (fresh apply / reference)
+modules      = ["nvidia", "nvidia-modeset", "nvidia-drm", "nvidia-uvm"]
+trigger      = ["nvidia-*-open", "linux-image-*", "linux-headers-*"]
+needs_reboot = true
+
+# Monado (thaytan fork + our commits) — ninja build, install to ~/.local.
+[components.monado]
+repo           = "src/monado-thaytan"
+branch         = "g2-linux-integration"
+build_dir      = "build"
+install_prefix = "/home/mrwhite0racle/.local"
+binary         = "/home/mrwhite0racle/.local/bin/monado-service"
+trigger        = []                              # rebuild on toolchain/system-lib changes
+
+# mutter 50.1 (Ubuntu deb + our quilt series) — dpkg-buildpackage, apt install, hold.
+[components.mutter]
+repo    = "src/mutter-patch/mutter-50.1"
+marker  = "+g2~"                                 # our package version suffix
+holds   = ["mutter", "libmutter-18-0", "mutter-common", "mutter-common-bin", "gir1.2-mutter-18"]
+trigger = ["mutter", "libmutter-*", "mutter-common*", "gnome-shell"]
+# the patched-deb selection + holds live in scripts/mutter-install-debs.sh (single source)
+
+# g2-studio userspace (python runtime) — no build; present + imports cleanly.
+[components.g2-studio]
+repo    = "/home/mrwhite0racle/g2-studio"
+module  = "core.vr_display"
+trigger = []

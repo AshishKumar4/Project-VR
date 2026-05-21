@@ -1,0 +1,70 @@
+From 9854e33a8ab0dec1853c4952c6bc4796a3d662b2 Mon Sep 17 00:00:00 2001
+From: Ashish Kumar Singh <ashishkmr472@gmail.com>
+Date: Tue, 19 May 2026 21:30:51 -0400
+Subject: [PATCH 06/10] d/steamvr_drv: skip RandR wait on Wayland sessions
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+vrcompositor on Wayland acquires the HMD via wp_drm_lease_device_v1,
+not X RandR. The existing RandR-mode wait — added to give vrcompositor
+time to find the HMD's native mode after USB activation — is irrelevant
+on Wayland (the HMD is hidden from XWayland anyway, per its non-desktop
+flag) and burns the full 20s timeout for no benefit. Detect a Wayland
+session via $WAYLAND_DISPLAY and bypass the wait.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ .../steamvr_drv/ovrd_driver.cpp               | 33 ++++++++++++++-----
+ 1 file changed, 24 insertions(+), 9 deletions(-)
+
+diff --git a/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp b/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
+index 7960c47be..17f38181a 100644
+--- a/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
++++ b/src/xrt/state_trackers/steamvr_drv/ovrd_driver.cpp
+@@ -1736,18 +1736,33 @@ CServerDriver_Monado::Init(vr::IVRDriverContext *pDriverContext)
+ 
+ 	// Block until the HMD's native video mode is enumerated by X RandR before
+ 	// returning from Init(). vrserver brings up vrcompositor immediately after
+-	// the driver loads, and vrcompositor scans RandR once to find a direct-mode
+-	// display matching the driver-reported HMD resolution. WMR headsets only
+-	// expose their native mode a few seconds after USB activation, so without
+-	// this wait vrcompositor scans too early and the direct-mode lease fails.
++	// the driver loads, and on X11 vrcompositor scans RandR once to find a
++	// direct-mode display matching the driver-reported HMD resolution. WMR
++	// headsets only expose their native mode a few seconds after USB
++	// activation, so without this wait vrcompositor scans too early and the
++	// direct-mode lease fails.
++	//
++	// On Wayland, vrcompositor acquires the HMD via the wp_drm_lease_device_v1
++	// protocol — not X RandR — so the wait is irrelevant and would burn the
++	// full timeout for no benefit (the HMD is hidden from XWayland by the
++	// compositor's non-desktop filtering). Skip the wait when a Wayland session
++	// is detected.
+ 	if (m_xhmd->hmd != NULL && m_xhmd->hmd->screens[0].w_pixels > 0) {
+ 		uint32_t want_w = (uint32_t)m_xhmd->hmd->screens[0].w_pixels;
+ 		uint32_t want_h = (uint32_t)m_xhmd->hmd->screens[0].h_pixels;
+-		ovrd_log("Waiting for HMD display mode %ux%u to enumerate in X RandR...\n", want_w, want_h);
+-		bool ready = ovrd_wait_for_hmd_randr_mode(want_w, want_h, 20000);
+-		ovrd_log("HMD display mode %ux%u in RandR: %s\n", want_w, want_h,
+-		         ready ? "present — vrcompositor can lease it"
+-		               : "not seen (timeout/no-X) — proceeding anyway");
++		const char *wl = getenv("WAYLAND_DISPLAY");
++		if (wl != NULL && wl[0] != '\0') {
++			ovrd_log("Wayland session detected (WAYLAND_DISPLAY=%s); skipping X RandR "
++			         "wait for HMD mode %ux%u — vrcompositor leases via DRM.\n",
++			         wl, want_w, want_h);
++		} else {
++			ovrd_log("Waiting for HMD display mode %ux%u to enumerate in X RandR...\n",
++			         want_w, want_h);
++			bool ready = ovrd_wait_for_hmd_randr_mode(want_w, want_h, 20000);
++			ovrd_log("HMD display mode %ux%u in RandR: %s\n", want_w, want_h,
++			         ready ? "present — vrcompositor can lease it"
++			               : "not seen (timeout/no-X) — proceeding anyway");
++		}
+ 	}
+ 
+ 	m_MonadoDeviceDriver = new CDeviceDriver_Monado(m_xinst, m_xhmd);
+-- 
+2.53.0
+
