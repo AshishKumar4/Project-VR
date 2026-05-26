@@ -40,3 +40,28 @@ __pycache__/
 /logs/
 # Internal audit report — kept on disk for context, not upstreamed.
 /AUDIT.md
+/captures/
+.analysis-venv/
+# Kernel-signing MOK (PRIVATE KEY — never commit).
+/infra/mok-kernel/
+
+# Internal design / research / audit notes — kept on disk, not upstreamed.
+/docs/CONSTELLATION-DATA-ASSOCIATION.md
+/docs/CONTROLLER-TRACKING-ROBUSTNESS-PLAN.md
+/docs/ESKF-DESIGN.md
+/docs/FUSION-ARCHITECTURE.md
+/docs/INERTIAL-ODOMETRY-PLAN.md
+/docs/INVESTIGATE-constellation.md
+/docs/INVESTIGATE-crash.md
+/docs/INVESTIGATE-imu.md
+/docs/KERNEL-BUILD-PLAN.md
+/docs/PIPELINE.md
+/docs/RESEARCH-fusion-sota.md
+/docs/RESEARCH-inertial-sota.md
+/docs/RESEARCH-optical-sota.md
+/docs/SOTA-PLAN.md
+/docs/TELEMETRY-AUDIT.md
+/docs/TELEMETRY-SCHEMA.md
+/docs/audit-2026-05-24/
+/RESEARCH-tearing.md
+/RESEARCH-tracking.md

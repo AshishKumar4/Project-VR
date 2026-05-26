@@ -86,8 +86,11 @@ Standalone `.diff` mirrors of every patch live in `../patches/`.
 
 ## What's NOT here
 
-- Userspace VR stack rebuild (Monado, Basalt, OpenComposite, OpenXR loader):
-  see `../build-track-a.sh`.
+- Userspace VR stack rebuild (Monado, Basalt, OpenComposite, OpenXR loader): no single script — see the
+  project `CLAUDE.md` ("Build & test" + "Run & capture"). In short: the SteamVR tracking driver =
+  `ninja -C ../src/monado-thaytan/build-cmake driver_monado.so` → `cp` to
+  `~/.local/share/steamvr-monado/bin/linux64/`; the standalone OpenXR `monado-service` =
+  `ninja -C ../src/monado-thaytan/build install` → `~/.local`.
 - mutter Debian-package rebuild: separate `../src/mutter-patch/` workflow.
 
 ## Notes on driver availability

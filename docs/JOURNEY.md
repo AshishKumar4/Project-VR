@@ -1,6 +1,4 @@
-> 🤖 **AI-authored & maintained — presented as-is.** This document is written and maintained by
-> Claude (Anthropic) as part of this project. It's a narrative captured with AI assistance, not a
-> hand-audited specification — when in doubt, trust the code.
+> 🤖 The docs in this repo (including this README) are written & maintained by Claude (Anthropic) and presented as-is.
 
 # The G2-on-Linux/NVIDIA Journey
 
@@ -8,11 +6,9 @@
 Linux/NVIDIA Wayland desktop — what we built, what we abandoned, the wrong turns,
 and the root causes we finally nailed.*
 
-**Synthesized 2026-05-21** from the patch index (`patches/INDEX.md`), the three
-gatherer reports (`patches/_index_sources/`), the seven agent-memory files, and
-the X11-era docs (`STATUS.md`, `BUGS.md`, `INVENTORY.md`, `diagnostics/`). Where
-older docs reach conclusions that newer truth has overturned, the correction is
-called out inline. Git ground-truth and agent memory win over older docs.
+A single narrative of how the headset came to work, distilled from the development
+history and the patch index ([`patches/INDEX.md`](../patches/INDEX.md)). Where an earlier
+conclusion was later overturned, the correction is noted inline; the code is the ground truth.
 
 ---
 
@@ -80,7 +76,7 @@ commit `a5df8568`).
    silently dropped and **4320×2160 never enumerated**; only a 2880×1440
    fallback survived. Fix: always walk descriptors at `sizeof(DESC) +
    payload_bytes_len` stride. This is the root cause of NVIDIA bug 5923212 ("G2
-   stuck at 2880×1440 on Linux"). It is *Bug 1* in `BUGS.md`, the most
+   stuck at 2880×1440 on Linux"). It is the most
    upstream-worthy discovery.
 
 2. **DP wardatabase HBR3 entry** (`dp_wardatabase.cpp`). Without an entry for HP's
@@ -149,8 +145,8 @@ compositor acquired it first try (`Acquired xlib display!` → direct mode at
 native res). This runtime hack is exactly what later became the kernel-driven
 Patch 20 on Wayland (§5.3).
 
-> **Correction (STATUS.md/BUGS.md said X; truth is Y):** `STATUS.md` and
-> `BUGS.md` (both 2026-05-15) recommend *against* Wayland — "X11 + RandR is our
+> **Correction (an earlier conclusion, now reversed):** the early X11-era notes
+> (2026-05-15) recommended *against* Wayland — "X11 + RandR is our
 > proven path … `wp_drm_lease_device_v1` is broken on NVIDIA … high risk, no
 > upside." That conclusion is **reversed**: the project moved to Wayland and
 > confirmed full VR there on 2026-05-21. Those docs are X11-era history. They are
@@ -165,7 +161,7 @@ built, sometimes ran end-to-end, and were then **deliberately dropped**. They
 survive only as archive `.diff`s. Documenting them is the point of this section —
 so future-us doesn't rebuild a dead end.
 
-> **Correction:** `INVENTORY.md` lists patches **03/07/08 as "applied + on
+> **Correction:** an earlier catalog listed patches **03/07/08 as "applied + on
 > branch."** Git ground-truth says otherwise — they are **absent from the tree**
 > (no `comp_window_direct_randr` change, **0** IVRVirtualDisplay references,
 > OpenVR still **1.16.8**). They are ARCHIVE-ONLY / abandoned.
@@ -209,7 +205,7 @@ Monado's NVIDIA allowlist had `"HPN"`, which didn't prefix-match NVIDIA's
 display name `"HP Inc. (DP-N)"`. The May-15 STATUS claimed this was changed to
 `"HP Inc."`.
 
-> **Correction (STATUS.md said X; truth is Y):** the change was **reverted /
+> **Correction (an earlier note, now corrected):** the change was **reverted /
 > never persisted**. `comp_settings.h:37` still reads `"HPN"`. The branch instead
 > carries upstream-style allowlist commits ("remove HP desktop monitor from NV
 > whitelist", "add bigscreen beyond to NV whitelist"). The runtime G2 allowlist
@@ -362,8 +358,7 @@ fine, then `FLIP` is rejected because that popen has no flip permission on the
 leased head — on X11, Xorg calls `GRANT_PERMISSIONS`; on the DRM-lease path,
 nothing does. So **Patch 22** built a DRM-lease → NVKMS bridge:
 per-apiHead `lesseeFlipPermissive` set at `CREATE_LEASE`, cleared at
-`REVOKE_LEASE`. `diagnostics/wayland-drm-lease-nvidia-vk-present.md` documents
-this as *the* fix.
+`REVOKE_LEASE`. It was documented at the time as *the* fix.
 
 > **This is where the discipline mattered.** Instrumentation
 > (G2DBG/G2DBG2/G2DBG3/G2DBG4 printks through the NVKMS flip path) revealed two
@@ -418,7 +413,7 @@ The falsification that clinched it (the **contention test**, the "$1000 bet"):
 So it's a **total** ISO budget, not per-head, not permission, not WSI, not a
 fundamental single-head limit.
 
-> **Correction (BUGS.md Bug 7 said X; truth is Y):** `BUGS.md` Bug 7 framed the
+> **Correction (an earlier framing, now corrected):** an earlier note framed the
 > symptom as "VK_KHR_display exclusive direct mode breaks other displays — reboot
 > required," an exclusivity state-machine bug. **Wrong.** The real ceiling is
 > total display ISO bandwidth on the 4-head AD103. X11 worked *alongside* the
@@ -664,22 +659,3 @@ gameplay — still awaits the user's confirmation.
     Before debugging upstream symptoms, run `which monado-service` and
     `ldd $(which basalt)` — fix install drift first.
 
----
-
-## 10. Document trust order (when sources disagree)
-
-Freshest → stalest, so future readers know which to believe:
-
-1. **Agent memory** (`g2-patch22-flip-eperm`, `g2-vr-display-autoneg`,
-   `g2-head-exhaustion-rootcause`, `g2-steamvr-working`, `g2-wake-via-monado`,
-   `g2-architecture-end-to-end`, `g2-x11-worked-wayland-bug`) — 2026-05-20/21.
-2. **`patches/INDEX.md`** — git-reconciled authoritative patch state.
-3. **`diagnostics/*.md`** — current on mechanics; the
-   `wayland-drm-lease-…` doc's *permission-bridge framing* is superseded by the
-   ISO-bandwidth root cause (Patch 22 still works/needed).
-4. **`INVENTORY.md`** — best top-level snapshot, but catalog stops at 16 and
-   wrongly lists 03/07/08 as applied.
-5. **`STATUS.md` / `BUGS.md` / `ROLLBACK.md` / `POST-REBOOT-CHECKLIST.md` /
-   `RESEARCH.md`** — 2026-05-15, X11/24.04 era. History only; several active
-   contradictions (anti-Wayland recommendation; Bug 7 exclusivity claim;
-   "HP Inc." edit; wrong kernel/driver versions).

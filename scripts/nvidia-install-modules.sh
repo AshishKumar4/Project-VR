@@ -19,11 +19,11 @@ MOK_CERT=/var/lib/shim-signed/mok/MOK.der
 NV_VERSION=$(awk -F= '/^NVIDIA_VERSION/ {gsub(/ /,"",$2); print $2}' "$SRC/version.mk")
 NV_MAJOR=$(echo "$NV_VERSION" | cut -d. -f1)
 TARGET=/lib/modules/$KVER/kernel/nvidia-${NV_MAJOR}-open
-[ -d "$TARGET" ] || {
-    echo "ERR: $TARGET missing — does Ubuntu ship linux-modules-nvidia-${NV_MAJOR}-open?" >&2
-    echo "If on a brand-new NVIDIA series, you may need to bootstrap via 'sudo apt install linux-modules-nvidia-${NV_MAJOR}-open-${KVER}' first." >&2
-    exit 1
-}
+if [ ! -d "$TARGET" ]; then
+    # Custom kernels have no distro nvidia-open package to bootstrap the dir; create it.
+    echo "note: $TARGET missing — creating it (custom kernel, no distro nvidia-open pkg)"
+    sudo mkdir -p "$TARGET"
+fi
 
 BACKUP=$RESEARCH/module-backup-${NV_VERSION}-$(date +%Y%m%d-%H%M%S)
 
@@ -41,11 +41,15 @@ for m in nvidia nvidia-modeset nvidia-drm nvidia-uvm; do
     }
 done
 
-# Backup originals
+# Backup originals (skip cleanly if none — e.g. fresh custom-kernel install)
 mkdir -p "$BACKUP"
-sudo cp -a "$TARGET"/*.ko "$BACKUP"/
-echo "Backed up to $BACKUP/:"
-ls -la "$BACKUP" | tail -n +2
+if compgen -G "$TARGET/*.ko" >/dev/null; then
+    sudo cp -a "$TARGET"/*.ko "$BACKUP"/
+    echo "Backed up to $BACKUP/:"
+    ls -la "$BACKUP" | tail -n +2
+else
+    echo "No existing modules in $TARGET to back up (fresh custom-kernel install)."
+fi
 
 # Sign + install
 for m in nvidia nvidia-modeset nvidia-drm nvidia-uvm; do

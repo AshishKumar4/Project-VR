@@ -32,8 +32,11 @@ g2ctl heal       # bring drifted components back in sync (self-heals conflicts)
 g2ctl doctor     # status -> heal -> verify
 g2ctl heal --component nvidia    # limit to one
 ```
-Reuses `scripts/` for NVIDIA (fetch/rebase/build/sign/install/hold). Monado =
-ninja → `~/.local`; mutter = `dpkg-buildpackage` → apt install + hold.
+Reuses `scripts/` for NVIDIA (fetch/rebase/build/sign/install/hold). Monado heal builds **both**
+products of the one repo: the OpenXR `monado-service` (`ninja -C build install` → `~/.local`) AND the
+SteamVR tracking driver `driver_monado.so` (`ninja -C build-cmake driver_monado.so`, then a backed-up,
+md5-verified `cp` to the `external_drivers` path). `status` reports the deployed driver's md5 and whether
+it is STALE vs the built one. mutter = `dpkg-buildpackage` → apt install + hold.
 
 ## Privilege model (security)
 `g2ctl` runs as the user. Monado heals fully unattended. **nvidia** and **mutter**

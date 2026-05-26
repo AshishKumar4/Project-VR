@@ -1,3 +1,5 @@
+<!-- Edited & maintained by Claude; presented as-is. -->
+
 # Monado consolidated patches (HP Reverb G2 / WMR on Linux)
 
 > 🤖 AI-authored & maintained, presented as-is.

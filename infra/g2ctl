@@ -13,7 +13,7 @@ Reuses scripts/ for NVIDIA. No external deps (tomllib is stdlib).
 Self-heal runs on a backup ref, is logged, verify-gated, and never pushes.
 """
 from __future__ import annotations
-import argparse, datetime, os, shutil, subprocess, sys, tomllib
+import argparse, datetime, hashlib, os, shutil, subprocess, sys, tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -45,6 +45,18 @@ def sh(cmd, cwd=None, env=None, capture=True):
 def git(repo, *args):
     rc, out = sh(["git", "-C", str(repo), *args])
     return rc, out.strip()
+
+
+def md5(path):
+    """Full md5 hex of a file, or '' if absent."""
+    p = Path(path)
+    if not p.exists():
+        return ""
+    h = hashlib.md5()
+    with open(p, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 class Log:
@@ -153,27 +165,85 @@ def nvidia_heal(m, c, log, auto):
 
 
 # ── monado ─────────────────────────────────────────────────────────────────
+# Two build products from one repo: the OpenXR `monado-service` (meson `build_dir`,
+# installed to ~/.local) for smoke tests, and the SteamVR tracking driver
+# `driver_monado.so` (cmake `cmake_build_dir`) deployed by a plain cp to
+# `steamvr_driver`. The cmake target's output sub-path is fixed by the build system.
+DRIVER_SO = "steamvr-monado/bin/linux64/driver_monado.so"
+
+
+def driver_built(repo, c):
+    return repo / c["cmake_build_dir"] / DRIVER_SO
+
+
 def monado_status(m, c):
-    ok = Path(c["binary"]).exists()
     repo = m["_ws"] / c["repo"]
+    binok = Path(c["binary"]).exists()
     _, head = git(repo, "rev-parse", "--short", "HEAD")
     dirty = bool(git(repo, "status", "--porcelain", "--untracked-files=no")[1])
-    tag = f"{C_OK}ok{C_OFF}" if ok else f"{C_WARN}MISSING{C_OFF}"
-    print(f"  monado    [{tag}] {c['binary']} head={head}" + ("  (tree dirty)" if dirty else ""))
+    # SteamVR driver: report deployed md5 and staleness vs the (already-)built one.
+    deployed = c["steamvr_driver"]
+    dep_md5 = md5(deployed)
+    built = driver_built(repo, c)
+    built_md5 = md5(built)
+    if not dep_md5:
+        drv = f"{C_WARN}MISSING{C_OFF}"
+    elif not built_md5:
+        drv = f"{dep_md5[:8]} (not built)"
+    elif dep_md5 != built_md5:
+        drv = f"{C_WARN}STALE{C_OFF} {dep_md5[:8]} != built {built_md5[:8]}"
+    else:
+        drv = f"{C_OK}fresh{C_OFF} {dep_md5[:8]}"
+    present = binok and bool(dep_md5)
+    ok = present and built_md5 in ("", dep_md5)
+    tag = (f"{C_OK}ok{C_OFF}" if ok
+           else f"{C_WARN}MISSING{C_OFF}" if not present
+           else f"{C_WARN}DRIFT{C_OFF}")
+    print(f"  monado    [{tag}] {c['binary']} head={head}"
+          + ("  (tree dirty)" if dirty else ""))
+    print(f"            steamvr-driver {drv}")
     return ok
+
+
+def steamvr_driver_heal(m, c, log):
+    """Build driver_monado.so (cmake) and deploy it (cp) to the SteamVR external
+    driver path, backing up the existing one and verifying the copy byte-for-byte."""
+    repo = m["_ws"] / c["repo"]
+    log("  monado: ninja build driver_monado.so (cmake)")
+    rc, out = sh(["ninja", "-C", c["cmake_build_dir"], "driver_monado.so"], cwd=str(repo))
+    log(out)
+    if rc:
+        return False
+    built = driver_built(repo, c)
+    if not built.exists():
+        log(f"  {C_ERR}monado: build reported success but {built} is missing{C_OFF}")
+        return False
+    deployed = Path(c["steamvr_driver"])
+    deployed.parent.mkdir(parents=True, exist_ok=True)
+    if deployed.exists():
+        ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        backup = deployed.with_name(deployed.name + f".before-{ts}")
+        shutil.copy2(deployed, backup)
+        log(f"  monado: backed up deployed driver -> {backup.name}")
+    shutil.copy2(built, deployed)
+    if md5(built) != md5(deployed):
+        log(f"  {C_ERR}monado: deployed driver md5 mismatch after cp — deploy FAILED{C_OFF}")
+        return False
+    log(f"  monado: deployed driver_monado.so ({md5(deployed)[:8]})")
+    return True
 
 
 def monado_heal(m, c, log, auto):
     repo = m["_ws"] / c["repo"]
     bd = c["build_dir"]
-    log("  monado: ninja build + install")
+    log("  monado: ninja build + install (OpenXR monado-service)")
     rc, out = sh(["ninja", "-C", bd], cwd=str(repo)); log(out)
     if rc: return False
     rc, out = sh(["ninja", "-C", bd, "install"], cwd=str(repo)); log(out)
     if rc: return False
     # CAP_SYS_NICE so monado's threads get real-time scheduling (O-4); best-effort.
     sh(["sudo", "setcap", "cap_sys_nice+ep", c["binary"]])
-    return True
+    return steamvr_driver_heal(m, c, log)
 
 
 # ── mutter ─────────────────────────────────────────────────────────────────

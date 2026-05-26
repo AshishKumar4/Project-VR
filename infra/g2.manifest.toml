@@ -19,13 +19,18 @@ modules      = ["nvidia", "nvidia-modeset", "nvidia-drm", "nvidia-uvm"]
 trigger      = ["nvidia-*-open", "linux-image-*", "linux-headers-*"]
 needs_reboot = true
 
-# Monado (thaytan fork + our commits) — ninja build, install to ~/.local.
+# Monado (thaytan fork + our commits). TWO products from one repo:
+#  - OpenXR monado-service: meson build_dir -> ~/.local (smoke tests).
+#  - SteamVR driver_monado.so: cmake cmake_build_dir -> deployed (cp) to steamvr_driver.
+#    SteamVR finds it via ~/.config/openvr/openvrpaths.vrpath external_drivers.
 [components.monado]
 repo           = "src/monado-thaytan"
 branch         = "g2-linux-integration"
 build_dir      = "build"
+cmake_build_dir = "build-cmake"
 install_prefix = "/home/mrwhite0racle/.local"
 binary         = "/home/mrwhite0racle/.local/bin/monado-service"
+steamvr_driver = "/home/mrwhite0racle/.local/share/steamvr-monado/bin/linux64/driver_monado.so"
 trigger        = []                              # rebuild on toolchain/system-lib changes
 
 # mutter 50.1 (Ubuntu deb + our quilt series) — dpkg-buildpackage, apt install, hold.
